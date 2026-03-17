@@ -1,5 +1,9 @@
 pub use aws_sdk_dynamodb::*;
 
+mod interceptors;
+mod create_table_ext;
+pub use create_table_ext::{CreateTableBuilderExt, CreateTableWithVectorIndexes};
+
 #[cfg(test)]
 mod tests {
 

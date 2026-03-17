@@ -5,3 +5,4 @@ mod proxy;
 mod http_tester;
 
 pub mod correct_line;
+pub mod vector_indexes;

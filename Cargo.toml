@@ -6,8 +6,11 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 aws-sdk-dynamodb = { version = "1.100.0", features = ["test-util"] }
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
 itertools = "0.14.0"
 reqwest = { version = "0.11", features = ["json"] }
+serde_json = "1"
 
 
 [dev-dependencies]
