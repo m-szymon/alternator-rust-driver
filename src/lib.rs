@@ -10,6 +10,8 @@ mod optimize_headers;
 mod query_plan;
 mod routing_scope;
 mod user_agent;
+pub mod vector;
+mod vector_interceptor;
 
 pub use crate::client::*;
 pub use crate::compression::*;
@@ -22,3 +24,6 @@ pub(crate) use crate::optimize_headers::*;
 pub(crate) use crate::query_plan::*;
 pub use crate::routing_scope::*;
 pub use crate::user_agent::*;
+pub use crate::vector::{Projection, SimilarityFunction, VectorAttribute, VectorIndex};
+pub(crate) use crate::vector_interceptor::VectorRequestStore;
+pub use crate::vector_interceptor::VectorSearchExt;

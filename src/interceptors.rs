@@ -66,6 +66,18 @@ impl Intercept for AlternatorInterceptor {
         _: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
+        // Inject any vector-search request extras (e.g. CreateTable's
+        // VectorIndexes) into the serialized JSON body. This must happen
+        // before compression, so the order is always:
+        // serialized JSON -> vector rewrite -> optional compression -> signing.
+        if let Some(vector_request) = cfg
+            .interceptor_state()
+            .load::<VectorRequestStore>()
+            .cloned()
+        {
+            inject_vector_request_extras(context, &vector_request)?;
+        }
+
         // check for overrides
         let request_compression = cfg
             .interceptor_state()
@@ -207,6 +219,74 @@ impl Intercept for AlternatorInterceptor {
 
         Ok(())
     }
+}
+
+/// Identifies the DynamoDB/Alternator operation for a request from its
+/// `x-amz-target` header, e.g. `DynamoDB_20120810.CreateTable`.
+fn operation_name_from_target(target: &str) -> Option<&str> {
+    target.split('.').next_back()
+}
+
+/// Injects vector-search request extras (currently only CreateTable's
+/// `VectorIndexes`) into the serialized JSON request body.
+///
+/// If vector state is attached to an operation that does not support it,
+/// this returns a clear local error instead of silently ignoring caller
+/// intent. If no vector state applies to this operation's extras, the body
+/// is left byte-for-byte unchanged.
+fn inject_vector_request_extras(
+    context: &mut BeforeTransmitInterceptorContextMut,
+    vector_request: &VectorRequestStore,
+) -> Result<(), BoxError> {
+    let target = context
+        .request()
+        .headers()
+        .get("x-amz-target")
+        .unwrap_or_default();
+    let operation = operation_name_from_target(target).unwrap_or_default();
+
+    let Some(vector_indexes) = vector_request.vector_indexes.as_ref() else {
+        return Ok(());
+    };
+
+    if operation != "CreateTable" {
+        return Err(format!(
+            "vector_indexes() was set on a customize() call for operation '{operation}', \
+             but VectorIndexes is only supported on CreateTable requests"
+        )
+        .into());
+    }
+
+    let body = context
+        .request_mut()
+        .body_mut()
+        .bytes()
+        .ok_or("body not collected")?
+        .to_vec();
+
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| format!("failed to parse JSON body: {e}"))?;
+
+    let indexes: Vec<serde_json::Value> = vector_indexes
+        .iter()
+        .map(|idx| {
+            let json_idx: crate::vector::VectorIndexJson = idx.into();
+            serde_json::to_value(&json_idx).expect("VectorIndexJson serialization should not fail")
+        })
+        .collect();
+
+    json["VectorIndexes"] = serde_json::Value::Array(indexes);
+
+    let new_body =
+        serde_json::to_vec(&json).map_err(|e| format!("failed to serialize JSON body: {e}"))?;
+
+    context
+        .request_mut()
+        .headers_mut()
+        .insert("content-length", new_body.len().to_string());
+    *context.request_mut().body_mut() = new_body.into();
+
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -464,6 +544,126 @@ mod tests {
     use aws_sdk_dynamodb::operation::batch_write_item::BatchWriteItemInput;
     use aws_sdk_dynamodb::types::{AttributeValue, DeleteRequest, PutRequest, WriteRequest};
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn vector_indexes_are_injected_before_compression_on_create_table() {
+        use aws_sdk_dynamodb::types::{
+            AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType,
+        };
+        use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
+        use aws_smithy_types::body::SdkBody;
+        use std::io::Read;
+
+        let http_client = StaticReplayClient::new(vec![ReplayEvent::new(
+            http::Request::builder()
+                .uri("http://127.0.0.1:1/")
+                .body(SdkBody::empty())
+                .unwrap(),
+            http::Response::builder()
+                .status(200)
+                .body(SdkBody::from("{\"TableDescription\":{}}"))
+                .unwrap(),
+        )]);
+
+        let config = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .endpoint_url("http://127.0.0.1:1")
+            .credentials_provider(
+                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+            )
+            .http_client(http_client.clone())
+            .interceptor(AlternatorInterceptor::new(
+                RequestCompression::enabled(
+                    crate::compression::CompressionAlgorithm::Gzip,
+                    crate::compression::CompressionLevel::default(),
+                    0,
+                ),
+                ResponseCompression::disabled(),
+                false,
+                UserAgent::default(),
+                true,
+            ))
+            .build();
+        let client = aws_sdk_dynamodb::Client::from_conf(config);
+
+        let va = crate::vector::VectorAttribute::builder()
+            .attribute_name("embedding")
+            .dimensions(128)
+            .build()
+            .unwrap();
+        let vi = crate::vector::VectorIndex::builder()
+            .index_name("vec_idx")
+            .vector_attribute(va)
+            .build()
+            .unwrap();
+
+        client
+            .create_table()
+            .table_name("test_table")
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name("pk")
+                    .attribute_type(ScalarAttributeType::S)
+                    .build()
+                    .unwrap(),
+            )
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name("pk")
+                    .key_type(KeyType::Hash)
+                    .build()
+                    .unwrap(),
+            )
+            .billing_mode(BillingMode::PayPerRequest)
+            .customize()
+            .vector_indexes(vec![vi])
+            .send()
+            .await
+            .expect("request should succeed against the replay client");
+
+        let requests = http_client.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1, "exactly one request should be sent");
+        let sent_request = &requests[0];
+
+        // Request compression must have applied: content-encoding is set and
+        // the body bytes are actually gzip-compressed.
+        assert_eq!(
+            sent_request.headers().get("content-encoding").unwrap(),
+            "gzip"
+        );
+
+        let compressed = sent_request.body().bytes().expect("body collected");
+        let mut decompressed = Vec::new();
+        flate2::read::GzDecoder::new(compressed)
+            .read_to_end(&mut decompressed)
+            .expect("valid gzip body");
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&decompressed).expect("decompressed body should be valid JSON");
+
+        // The vector rewrite happened before compression: VectorIndexes is
+        // present in the *decompressed* body.
+        assert_eq!(json["VectorIndexes"][0]["IndexName"], "vec_idx");
+        assert_eq!(
+            json["VectorIndexes"][0]["VectorAttribute"]["AttributeName"],
+            "embedding"
+        );
+        assert_eq!(json["TableName"], "test_table");
+    }
+
+    #[test]
+    fn operation_name_from_target_extracts_operation() {
+        assert_eq!(
+            operation_name_from_target("DynamoDB_20120810.CreateTable"),
+            Some("CreateTable")
+        );
+        assert_eq!(
+            operation_name_from_target("DynamoDB_20120810.PutItem"),
+            Some("PutItem")
+        );
+        assert_eq!(operation_name_from_target(""), Some(""));
+    }
 
     fn s(value: &str) -> AttributeValue {
         AttributeValue::S(value.to_string())
