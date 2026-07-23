@@ -67,15 +67,25 @@ impl Intercept for AlternatorInterceptor {
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
         // Inject any vector-search request extras (e.g. CreateTable's
-        // VectorIndexes) into the serialized JSON body. This must happen
-        // before compression, so the order is always:
+        // VectorIndexes) into the serialized JSON body, and rewrite any
+        // FLOAT32VECTOR marker binaries into `{"FLOAT32VECTOR": [...]}`.
+        // This must happen before compression, so the order is always:
         // serialized JSON -> vector rewrite -> optional compression -> signing.
-        if let Some(vector_request) = cfg
+        let vector_request = cfg
             .interceptor_state()
             .load::<VectorRequestStore>()
-            .cloned()
-        {
-            inject_vector_request_extras(context, &vector_request)?;
+            .cloned();
+        let body_may_have_marker = context
+            .request()
+            .body()
+            .bytes()
+            .map(|b| {
+                let s = String::from_utf8_lossy(b);
+                s.contains(crate::float32_vector::quick_base64_signature())
+            })
+            .unwrap_or(false);
+        if vector_request.is_some() || body_may_have_marker {
+            rewrite_vector_request_body(context, vector_request.as_ref(), body_may_have_marker)?;
         }
 
         // check for overrides
@@ -227,35 +237,29 @@ fn operation_name_from_target(target: &str) -> Option<&str> {
     target.split('.').next_back()
 }
 
-/// Injects vector-search request extras (currently only CreateTable's
-/// `VectorIndexes`) into the serialized JSON request body.
+/// Injects vector-search request extras (`CreateTable.VectorIndexes`,
+/// `UpdateTable.VectorIndexUpdates`, `Query.VectorSearch`) into the
+/// serialized JSON request body, and recursively rewrites any
+/// `FLOAT32VECTOR` marker binaries into `{"FLOAT32VECTOR": [...]}`.
 ///
-/// If vector state is attached to an operation that does not support it,
-/// this returns a clear local error instead of silently ignoring caller
-/// intent. If no vector state applies to this operation's extras, the body
-/// is left byte-for-byte unchanged.
-fn inject_vector_request_extras(
+/// If vector extras are attached to an operation that does not support
+/// them, this returns a clear local error instead of silently ignoring
+/// caller intent. If neither extras nor marker binaries apply, the body is
+/// left byte-for-byte unchanged.
+fn rewrite_vector_request_body(
     context: &mut BeforeTransmitInterceptorContextMut,
-    vector_request: &VectorRequestStore,
+    vector_request: Option<&VectorRequestStore>,
+    body_may_have_marker: bool,
 ) -> Result<(), BoxError> {
     let target = context
         .request()
         .headers()
         .get("x-amz-target")
-        .unwrap_or_default();
-    let operation = operation_name_from_target(target).unwrap_or_default();
-
-    let Some(vector_indexes) = vector_request.vector_indexes.as_ref() else {
-        return Ok(());
-    };
-
-    if operation != "CreateTable" {
-        return Err(format!(
-            "vector_indexes() was set on a customize() call for operation '{operation}', \
-             but VectorIndexes is only supported on CreateTable requests"
-        )
-        .into());
-    }
+        .unwrap_or_default()
+        .to_string();
+    let operation = operation_name_from_target(&target)
+        .unwrap_or_default()
+        .to_string();
 
     let body = context
         .request_mut()
@@ -267,15 +271,103 @@ fn inject_vector_request_extras(
     let mut json: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| format!("failed to parse JSON body: {e}"))?;
 
-    let indexes: Vec<serde_json::Value> = vector_indexes
-        .iter()
-        .map(|idx| {
-            let json_idx: crate::vector::VectorIndexJson = idx.into();
-            serde_json::to_value(&json_idx).expect("VectorIndexJson serialization should not fail")
-        })
-        .collect();
+    let mut changed = false;
 
-    json["VectorIndexes"] = serde_json::Value::Array(indexes);
+    if let Some(vector_request) = vector_request {
+        if let Some(vector_indexes) = vector_request.vector_indexes.as_ref() {
+            if operation != "CreateTable" {
+                return Err(format!(
+                    "vector_indexes() was set on a customize() call for operation '{operation}', \
+                     but VectorIndexes is only supported on CreateTable requests"
+                )
+                .into());
+            }
+            let indexes: Vec<serde_json::Value> = vector_indexes
+                .iter()
+                .map(|idx| {
+                    let json_idx: crate::vector::VectorIndexJson = idx.into();
+                    serde_json::to_value(&json_idx)
+                        .expect("VectorIndexJson serialization should not fail")
+                })
+                .collect();
+            json["VectorIndexes"] = serde_json::Value::Array(indexes);
+            changed = true;
+        }
+
+        if let Some(updates) = vector_request.vector_index_updates.as_ref() {
+            if operation != "UpdateTable" {
+                return Err(format!(
+                    "vector_index_updates() was set on a customize() call for operation \
+                     '{operation}', but VectorIndexUpdates is only supported on UpdateTable requests"
+                )
+                .into());
+            }
+            if updates.len() != 1 {
+                return Err(format!(
+                    "UpdateTable.VectorIndexUpdates must contain exactly one update per \
+                     request, got {}",
+                    updates.len()
+                )
+                .into());
+            }
+            if json
+                .get("GlobalSecondaryIndexUpdates")
+                .and_then(|v| v.as_array())
+                .is_some_and(|arr| !arr.is_empty())
+            {
+                return Err(
+                    "vector-index updates cannot be combined with GlobalSecondaryIndexUpdates \
+                     in the same UpdateTable request"
+                        .into(),
+                );
+            }
+            let updates: Vec<serde_json::Value> = updates
+                .iter()
+                .map(|u| {
+                    let json_u: crate::vector::VectorIndexUpdateJson = u.into();
+                    serde_json::to_value(&json_u)
+                        .expect("VectorIndexUpdateJson serialization should not fail")
+                })
+                .collect();
+            json["VectorIndexUpdates"] = serde_json::Value::Array(updates);
+            changed = true;
+        }
+
+        if let Some(search) = vector_request.vector_search.as_ref() {
+            if operation != "Query" {
+                return Err(format!(
+                    "vector_search() was set on a customize() call for operation '{operation}', \
+                     but VectorSearch is only supported on Query requests"
+                )
+                .into());
+            }
+            let json_search: crate::vector::VectorSearchJson = search.into();
+            json["VectorSearch"] = serde_json::to_value(&json_search)
+                .expect("VectorSearchJson serialization should not fail");
+            changed = true;
+
+            validate_vector_query_request(&json, search.return_scores.is_some())?;
+        }
+    }
+
+    // The compact query-vector form injects its own marker binary (see
+    // `VectorSearch::new`) as part of `json` above, which the initial
+    // `body_may_have_marker` scan (taken before that insertion) cannot have
+    // seen, so it must also trigger the marker rewrite pass.
+    let vector_search_may_have_marker =
+        vector_request.is_some_and(|vector_request| vector_request.vector_search.is_some());
+
+    if body_may_have_marker || vector_search_may_have_marker {
+        let before = json.clone();
+        crate::float32_vector::rewrite_request_json_markers(&mut json);
+        if json != before {
+            changed = true;
+        }
+    }
+
+    if !changed {
+        return Ok(());
+    }
 
     let new_body =
         serde_json::to_vec(&json).map_err(|e| format!("failed to serialize JSON body: {e}"))?;
@@ -285,6 +377,54 @@ fn inject_vector_request_extras(
         .headers_mut()
         .insert("content-length", new_body.len().to_string());
     *context.request_mut().body_mut() = new_body.into();
+
+    Ok(())
+}
+
+/// Validates a generated `Query` request body when `VectorSearch` is
+/// present, returning a descriptive local error instead of letting an
+/// unsupported combination reach the server. Schema-dependent validation
+/// (index existence, dimensionality) remains server-owned.
+fn validate_vector_query_request(
+    json: &serde_json::Value,
+    has_return_scores: bool,
+) -> Result<(), BoxError> {
+    let index_name = json.get("IndexName").and_then(|v| v.as_str());
+    if index_name.is_none_or(str::is_empty) {
+        return Err("vector-search queries require IndexName".into());
+    }
+
+    let limit = json.get("Limit").and_then(|v| v.as_i64());
+    match limit {
+        None => return Err("vector-search queries require Limit".into()),
+        Some(limit) if !(1..=1000).contains(&limit) => {
+            return Err(format!(
+                "vector-search queries require Limit between 1 and 1000, got {limit}"
+            )
+            .into());
+        }
+        _ => {}
+    }
+
+    if json.get("ConsistentRead").and_then(|v| v.as_bool()) == Some(true) {
+        return Err("vector-search queries do not support ConsistentRead(true)".into());
+    }
+
+    if json.get("ExclusiveStartKey").is_some_and(|v| !v.is_null()) {
+        return Err("vector-search queries do not support ExclusiveStartKey".into());
+    }
+
+    if json.get("ScanIndexForward").is_some() {
+        return Err("vector-search queries do not support ScanIndexForward".into());
+    }
+
+    if json.get("QueryFilter").is_some_and(|v| !v.is_null()) {
+        return Err("vector-search queries do not support the legacy QueryFilter".into());
+    }
+
+    if has_return_scores && json.get("Select").and_then(|v| v.as_str()) == Some("COUNT") {
+        return Err("ReturnScores::Similarity is not supported with Select::Count".into());
+    }
 
     Ok(())
 }
@@ -650,6 +790,362 @@ mod tests {
             "embedding"
         );
         assert_eq!(json["TableName"], "test_table");
+    }
+
+    fn make_replay_client(
+        response_body: &str,
+    ) -> (
+        aws_sdk_dynamodb::Client,
+        aws_smithy_runtime::client::http::test_util::StaticReplayClient,
+    ) {
+        use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
+        use aws_smithy_types::body::SdkBody;
+
+        let http_client = StaticReplayClient::new(vec![ReplayEvent::new(
+            http::Request::builder()
+                .uri("http://127.0.0.1:1/")
+                .body(SdkBody::empty())
+                .unwrap(),
+            http::Response::builder()
+                .status(200)
+                .body(SdkBody::from(response_body))
+                .unwrap(),
+        )]);
+
+        let config = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .endpoint_url("http://127.0.0.1:1")
+            .credentials_provider(
+                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+            )
+            .http_client(http_client.clone())
+            .interceptor(AlternatorInterceptor::new(
+                RequestCompression::disabled(),
+                ResponseCompression::disabled(),
+                false,
+                UserAgent::default(),
+                true,
+            ))
+            .build();
+        (aws_sdk_dynamodb::Client::from_conf(config), http_client)
+    }
+
+    #[tokio::test]
+    async fn vector_index_updates_are_injected_on_update_table() {
+        let (client, http_client) = make_replay_client("{\"TableDescription\":{}}");
+
+        let va = crate::vector::VectorAttribute::builder()
+            .attribute_name("embedding")
+            .dimensions(128)
+            .build()
+            .unwrap();
+        let vi = crate::vector::VectorIndex::builder()
+            .index_name("vec_idx")
+            .vector_attribute(va)
+            .build()
+            .unwrap();
+
+        client
+            .update_table()
+            .table_name("test_table")
+            .customize()
+            .vector_index_updates(vec![crate::vector::VectorIndexUpdate::Create(vi)])
+            .send()
+            .await
+            .expect("request should succeed against the replay client");
+
+        let requests = http_client.actual_requests().collect::<Vec<_>>();
+        let json: serde_json::Value =
+            serde_json::from_slice(requests[0].body().bytes().unwrap()).unwrap();
+        assert_eq!(
+            json["VectorIndexUpdates"][0]["Create"]["IndexName"],
+            "vec_idx"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_search_is_injected_on_query() {
+        let (client, http_client) = make_replay_client("{\"Items\":[],\"Count\":0}");
+
+        let search = crate::vector::VectorSearch::new(vec![1.0, 2.0, 3.0])
+            .unwrap()
+            .with_return_scores(crate::vector::ReturnScores::Similarity);
+
+        client
+            .query()
+            .table_name("test_table")
+            .index_name("embedding_idx")
+            .limit(10)
+            .customize()
+            .vector_search(search)
+            .send()
+            .await
+            .expect("request should succeed against the replay client");
+
+        let requests = http_client.actual_requests().collect::<Vec<_>>();
+        let json: serde_json::Value =
+            serde_json::from_slice(requests[0].body().bytes().unwrap()).unwrap();
+        assert_eq!(
+            json["VectorSearch"]["QueryVector"]["FLOAT32VECTOR"],
+            serde_json::json!([1.0, 2.0, 3.0])
+        );
+        assert_eq!(json["VectorSearch"]["ReturnScores"], "SIMILARITY");
+    }
+
+    #[tokio::test]
+    async fn vector_index_delete_is_injected_on_update_table() {
+        let (client, http_client) = make_replay_client("{\"TableDescription\":{}}");
+
+        client
+            .update_table()
+            .table_name("test_table")
+            .customize()
+            .vector_index_updates(vec![crate::vector::VectorIndexUpdate::Delete {
+                index_name: "vec_idx".to_string(),
+            }])
+            .send()
+            .await
+            .expect("request should succeed against the replay client");
+
+        let requests = http_client.actual_requests().collect::<Vec<_>>();
+        let json: serde_json::Value =
+            serde_json::from_slice(requests[0].body().bytes().unwrap()).unwrap();
+        assert_eq!(
+            json["VectorIndexUpdates"][0]["Delete"]["IndexName"],
+            "vec_idx"
+        );
+        assert!(json["VectorIndexUpdates"][0].get("Create").is_none());
+    }
+
+    #[tokio::test]
+    async fn vector_search_from_query_vector_uses_standard_list_on_wire() {
+        let (client, http_client) = make_replay_client("{\"Items\":[],\"Count\":0}");
+
+        let search = crate::vector::VectorSearch::from_query_vector(vec![
+            AttributeValue::N("1".to_string()),
+            AttributeValue::N("2".to_string()),
+            AttributeValue::N("3".to_string()),
+        ])
+        .unwrap();
+
+        client
+            .query()
+            .table_name("test_table")
+            .index_name("embedding_idx")
+            .limit(10)
+            .customize()
+            .vector_search(search)
+            .send()
+            .await
+            .expect("request should succeed against the replay client");
+
+        let requests = http_client.actual_requests().collect::<Vec<_>>();
+        let json: serde_json::Value =
+            serde_json::from_slice(requests[0].body().bytes().unwrap()).unwrap();
+        assert_eq!(
+            json["VectorSearch"]["QueryVector"]["L"],
+            serde_json::json!([{ "N": "1" }, { "N": "2" }, { "N": "3" }])
+        );
+        assert!(
+            json["VectorSearch"]["QueryVector"]
+                .get("FLOAT32VECTOR")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_query_rejects_missing_index_name() {
+        let (client, http_client) = make_replay_client("{\"Items\":[],\"Count\":0}");
+        let search = crate::vector::VectorSearch::new(vec![1.0]).unwrap();
+
+        let err = client
+            .query()
+            .table_name("test_table")
+            .limit(10)
+            .customize()
+            .vector_search(search)
+            .send()
+            .await
+            .expect_err("request should be rejected locally");
+        assert!(format!("{err:?}").contains("require IndexName"));
+        assert!(http_client.actual_requests().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn vector_query_rejects_missing_limit() {
+        let (client, http_client) = make_replay_client("{\"Items\":[],\"Count\":0}");
+        let search = crate::vector::VectorSearch::new(vec![1.0]).unwrap();
+
+        let err = client
+            .query()
+            .table_name("test_table")
+            .index_name("embedding_idx")
+            .customize()
+            .vector_search(search)
+            .send()
+            .await
+            .expect_err("request should be rejected locally");
+        assert!(format!("{err:?}").contains("require Limit"));
+        assert!(http_client.actual_requests().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn vector_query_rejects_limit_out_of_range() {
+        for limit in [0i32, 1001i32] {
+            let (client, http_client) = make_replay_client("{\"Items\":[],\"Count\":0}");
+            let search = crate::vector::VectorSearch::new(vec![1.0]).unwrap();
+
+            let err = client
+                .query()
+                .table_name("test_table")
+                .index_name("embedding_idx")
+                .limit(limit)
+                .customize()
+                .vector_search(search)
+                .send()
+                .await
+                .expect_err("request should be rejected locally");
+            assert!(
+                format!("{err:?}").contains("require Limit between 1 and 1000"),
+                "limit {limit} should be rejected, got: {err:?}"
+            );
+            assert!(http_client.actual_requests().next().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_query_rejects_consistent_read_true() {
+        let (client, http_client) = make_replay_client("{\"Items\":[],\"Count\":0}");
+        let search = crate::vector::VectorSearch::new(vec![1.0]).unwrap();
+
+        let err = client
+            .query()
+            .table_name("test_table")
+            .index_name("embedding_idx")
+            .limit(10)
+            .consistent_read(true)
+            .customize()
+            .vector_search(search)
+            .send()
+            .await
+            .expect_err("request should be rejected locally");
+        assert!(format!("{err:?}").contains("ConsistentRead(true)"));
+        assert!(http_client.actual_requests().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn vector_query_rejects_exclusive_start_key() {
+        let (client, http_client) = make_replay_client("{\"Items\":[],\"Count\":0}");
+        let search = crate::vector::VectorSearch::new(vec![1.0]).unwrap();
+
+        let err = client
+            .query()
+            .table_name("test_table")
+            .index_name("embedding_idx")
+            .limit(10)
+            .exclusive_start_key("pk", s("row1"))
+            .customize()
+            .vector_search(search)
+            .send()
+            .await
+            .expect_err("request should be rejected locally");
+        assert!(format!("{err:?}").contains("ExclusiveStartKey"));
+        assert!(http_client.actual_requests().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn vector_query_rejects_scan_index_forward() {
+        let (client, http_client) = make_replay_client("{\"Items\":[],\"Count\":0}");
+        let search = crate::vector::VectorSearch::new(vec![1.0]).unwrap();
+
+        let err = client
+            .query()
+            .table_name("test_table")
+            .index_name("embedding_idx")
+            .limit(10)
+            .scan_index_forward(false)
+            .customize()
+            .vector_search(search)
+            .send()
+            .await
+            .expect_err("request should be rejected locally");
+        assert!(format!("{err:?}").contains("ScanIndexForward"));
+        assert!(http_client.actual_requests().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn vector_query_rejects_return_scores_similarity_with_select_count() {
+        let (client, http_client) = make_replay_client("{\"Items\":[],\"Count\":0}");
+        let search = crate::vector::VectorSearch::new(vec![1.0])
+            .unwrap()
+            .with_return_scores(crate::vector::ReturnScores::Similarity);
+
+        let err = client
+            .query()
+            .table_name("test_table")
+            .index_name("embedding_idx")
+            .limit(10)
+            .select(aws_sdk_dynamodb::types::Select::Count)
+            .customize()
+            .vector_search(search)
+            .send()
+            .await
+            .expect_err("request should be rejected locally");
+        assert!(
+            format!("{err:?}")
+                .contains("ReturnScores::Similarity is not supported with Select::Count")
+        );
+        assert!(http_client.actual_requests().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn marker_binaries_are_rewritten_to_float32vector_in_put_item() {
+        let (client, http_client) = make_replay_client("{}");
+
+        let av =
+            crate::float32_vector::Float32Vector::to_attribute_value(vec![1.0, 2.0, 3.0]).unwrap();
+
+        client
+            .put_item()
+            .table_name("test_table")
+            .item("pk", s("row1"))
+            .item("embedding", av)
+            .send()
+            .await
+            .expect("request should succeed against the replay client");
+
+        let requests = http_client.actual_requests().collect::<Vec<_>>();
+        let json: serde_json::Value =
+            serde_json::from_slice(requests[0].body().bytes().unwrap()).unwrap();
+        assert_eq!(
+            json["Item"]["embedding"]["FLOAT32VECTOR"],
+            serde_json::json!([1.0, 2.0, 3.0])
+        );
+        assert_eq!(json["Item"]["pk"]["S"], "row1");
+    }
+
+    #[tokio::test]
+    async fn ordinary_binary_values_are_left_unchanged_in_put_item() {
+        let (client, http_client) = make_replay_client("{}");
+
+        client
+            .put_item()
+            .table_name("test_table")
+            .item("pk", s("row1"))
+            .item(
+                "blob",
+                AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(vec![1, 2, 3, 4])),
+            )
+            .send()
+            .await
+            .expect("request should succeed against the replay client");
+
+        let requests = http_client.actual_requests().collect::<Vec<_>>();
+        let json: serde_json::Value =
+            serde_json::from_slice(requests[0].body().bytes().unwrap()).unwrap();
+        assert!(json["Item"]["blob"].get("FLOAT32VECTOR").is_none());
+        assert!(json["Item"]["blob"].get("B").is_some());
     }
 
     #[test]

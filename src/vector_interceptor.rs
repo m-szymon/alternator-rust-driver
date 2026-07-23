@@ -1,4 +1,4 @@
-use crate::vector::VectorIndex;
+use crate::vector::{VectorIndex, VectorIndexUpdate, VectorSearch};
 
 use aws_sdk_dynamodb::client::customize::CustomizableOperation;
 use aws_smithy_runtime_api::box_error::BoxError;
@@ -17,6 +17,8 @@ use aws_smithy_types::config_bag::{ConfigBag, Storable, StoreReplace};
 #[derive(Debug, Clone, Default)]
 pub(crate) struct VectorRequestStore {
     pub(crate) vector_indexes: Option<Vec<VectorIndex>>,
+    pub(crate) vector_index_updates: Option<Vec<VectorIndexUpdate>>,
+    pub(crate) vector_search: Option<VectorSearch>,
 }
 
 impl Storable for VectorRequestStore {
@@ -36,6 +38,25 @@ impl VectorRequestStoreInterceptor {
         Self {
             store: VectorRequestStore {
                 vector_indexes: Some(vector_indexes),
+                ..Default::default()
+            },
+        }
+    }
+
+    pub(crate) fn for_vector_index_updates(updates: Vec<VectorIndexUpdate>) -> Self {
+        Self {
+            store: VectorRequestStore {
+                vector_index_updates: Some(updates),
+                ..Default::default()
+            },
+        }
+    }
+
+    pub(crate) fn for_vector_search(search: VectorSearch) -> Self {
+        Self {
+            store: VectorRequestStore {
+                vector_search: Some(search),
+                ..Default::default()
             },
         }
     }
@@ -58,15 +79,73 @@ impl Intercept for VectorRequestStoreInterceptor {
     }
 }
 
-/// Extension trait that adds vector search capabilities to
+/// Extension trait that adds `VectorIndexes` support to CreateTable's
 /// [CustomizableOperation](aws_sdk_dynamodb::client::customize::CustomizableOperation).
-pub trait VectorSearchExt<T, E, B> {
+///
+/// Implemented only for the generated CreateTable customizable operation, so
+/// misuse on other operations is a compile error rather than a runtime one.
+pub trait CreateTableVectorExt {
     fn vector_indexes(self, indexes: Vec<VectorIndex>) -> Self;
 }
 
-impl<T, E, B> VectorSearchExt<T, E, B> for CustomizableOperation<T, E, B> {
+impl<E, B> CreateTableVectorExt
+    for CustomizableOperation<aws_sdk_dynamodb::operation::create_table::CreateTableOutput, E, B>
+{
     fn vector_indexes(self, indexes: Vec<VectorIndex>) -> Self {
         self.interceptor(VectorRequestStoreInterceptor::for_vector_indexes(indexes))
+    }
+}
+
+/// Extension trait that adds `VectorIndexUpdates` support to UpdateTable's
+/// [CustomizableOperation](aws_sdk_dynamodb::client::customize::CustomizableOperation).
+///
+/// Implemented only for the generated UpdateTable customizable operation, so
+/// misuse on other operations is a compile error rather than a runtime one:
+///
+/// ```compile_fail
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// use alternator_driver::{AlternatorClient, AlternatorConfig, UpdateTableVectorExt, VectorIndexUpdate};
+///
+/// let client = AlternatorClient::from_conf(
+///     AlternatorConfig::builder().behavior_version_latest().build(),
+/// );
+///
+/// // `vector_index_updates` is only defined for UpdateTable, not CreateTable.
+/// let _ = client
+///     .create_table()
+///     .table_name("t")
+///     .customize()
+///     .vector_index_updates(Vec::<VectorIndexUpdate>::new());
+/// # });
+/// ```
+pub trait UpdateTableVectorExt {
+    fn vector_index_updates(self, updates: Vec<VectorIndexUpdate>) -> Self;
+}
+
+impl<E, B> UpdateTableVectorExt
+    for CustomizableOperation<aws_sdk_dynamodb::operation::update_table::UpdateTableOutput, E, B>
+{
+    fn vector_index_updates(self, updates: Vec<VectorIndexUpdate>) -> Self {
+        self.interceptor(VectorRequestStoreInterceptor::for_vector_index_updates(
+            updates,
+        ))
+    }
+}
+
+/// Extension trait that adds `VectorSearch` support to Query's
+/// [CustomizableOperation](aws_sdk_dynamodb::client::customize::CustomizableOperation).
+///
+/// Implemented only for the generated Query customizable operation, so
+/// misuse on other operations is a compile error rather than a runtime one.
+pub trait QueryVectorExt {
+    fn vector_search(self, search: VectorSearch) -> Self;
+}
+
+impl<E, B> QueryVectorExt
+    for CustomizableOperation<aws_sdk_dynamodb::operation::query::QueryOutput, E, B>
+{
+    fn vector_search(self, search: VectorSearch) -> Self {
+        self.interceptor(VectorRequestStoreInterceptor::for_vector_search(search))
     }
 }
 

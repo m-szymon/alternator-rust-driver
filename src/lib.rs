@@ -3,6 +3,7 @@ mod compression;
 mod config;
 mod customize;
 mod decompression;
+pub mod float32_vector;
 mod interceptors;
 pub mod keyrouting;
 mod live_nodes;
@@ -17,6 +18,7 @@ pub use crate::client::*;
 pub use crate::compression::*;
 pub use crate::config::*;
 pub use crate::customize::*;
+pub use crate::float32_vector::{Float32Vector, Float32VectorError, Float32VectorExt};
 pub(crate) use crate::interceptors::*;
 pub use crate::keyrouting::{KeyRouteAffinityConfig, KeyRouteAffinityType};
 pub(crate) use crate::live_nodes::*;
@@ -24,6 +26,9 @@ pub(crate) use crate::optimize_headers::*;
 pub(crate) use crate::query_plan::*;
 pub use crate::routing_scope::*;
 pub use crate::user_agent::*;
-pub use crate::vector::{Projection, SimilarityFunction, VectorAttribute, VectorIndex};
+pub use crate::vector::{
+    IndexStatus, Projection, ProjectionType, ReturnScores, SimilarityFunction, VectorAttribute,
+    VectorIndex, VectorIndexUpdate, VectorSearch,
+};
 pub(crate) use crate::vector_interceptor::VectorRequestStore;
-pub use crate::vector_interceptor::VectorSearchExt;
+pub use crate::vector_interceptor::{CreateTableVectorExt, QueryVectorExt, UpdateTableVectorExt};
