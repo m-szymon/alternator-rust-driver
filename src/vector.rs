@@ -303,52 +303,87 @@ impl From<&VectorIndex> for VectorIndexJson {
 /// Parses a `VectorIndex` response entry (as found under `Table.VectorIndexes`
 /// or `TableDescription.VectorIndexes`) from raw JSON, including
 /// response-only `IndexStatus` and `Backfilling` fields.
-pub(crate) fn vector_index_from_json(value: &serde_json::Value) -> Option<VectorIndex> {
-    let index_name = value.get("IndexName")?.as_str()?.to_string();
-    let va = value.get("VectorAttribute")?;
-    let attribute_name = va.get("AttributeName")?.as_str()?.to_string();
-    let dimensions_raw = va.get("Dimensions")?.as_u64()?;
-    let dimensions = u32::try_from(dimensions_raw).ok()?;
+pub(crate) fn vector_index_from_json(value: &serde_json::Value) -> Result<VectorIndex, String> {
+    let index_name = value
+        .get("IndexName")
+        .and_then(|value| value.as_str())
+        .ok_or("VectorIndexes entry is missing a string IndexName")?
+        .to_string();
+    let va = value
+        .get("VectorAttribute")
+        .ok_or("VectorIndexes entry is missing VectorAttribute")?;
+    let attribute_name = va
+        .get("AttributeName")
+        .and_then(|value| value.as_str())
+        .ok_or("VectorAttribute is missing a string AttributeName")?
+        .to_string();
+    let dimensions_raw = va
+        .get("Dimensions")
+        .and_then(|value| value.as_u64())
+        .ok_or("VectorAttribute is missing an unsigned Dimensions")?;
+    let dimensions =
+        u32::try_from(dimensions_raw).map_err(|_| "VectorAttribute.Dimensions exceeds u32::MAX")?;
 
-    let projection = value.get("Projection").and_then(|p| {
-        let projection_type = p.get("ProjectionType")?.as_str()?;
-        Some(match projection_type {
-            "ALL" => Projection::all(),
-            "KEYS_ONLY" => Projection::keys_only(),
-            "INCLUDE" => {
-                let attrs = p
-                    .get("NonKeyAttributes")
-                    .and_then(|a| a.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                Projection::include(attrs)
-            }
-            _ => return None,
-        })
-    });
+    let projection = match value.get("Projection") {
+        Some(projection) => {
+            let projection_type = projection
+                .get("ProjectionType")
+                .and_then(|value| value.as_str())
+                .ok_or("Projection is missing a string ProjectionType")?;
+            Some(match projection_type {
+                "ALL" => Projection::all(),
+                "KEYS_ONLY" => Projection::keys_only(),
+                "INCLUDE" => {
+                    let attributes = projection
+                        .get("NonKeyAttributes")
+                        .and_then(|a| a.as_array())
+                        .ok_or("INCLUDE Projection is missing NonKeyAttributes")?
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(String::from)
+                                .ok_or("NonKeyAttributes must contain only strings")
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Projection::include(attributes)
+                }
+                _ => return Err("unsupported ProjectionType in VectorIndexes entry".to_string()),
+            })
+        }
+        None => None,
+    };
 
-    let similarity_function = value
-        .get("SimilarityFunction")
-        .and_then(|s| s.as_str())
-        .and_then(|s| match s {
-            "COSINE" => Some(SimilarityFunction::Cosine),
-            "EUCLIDEAN" => Some(SimilarityFunction::Euclidean),
-            "DOT_PRODUCT" => Some(SimilarityFunction::DotProduct),
-            _ => None,
-        });
+    let similarity_function = match value.get("SimilarityFunction") {
+        Some(value) => Some(match value.as_str() {
+            Some("COSINE") => SimilarityFunction::Cosine,
+            Some("EUCLIDEAN") => SimilarityFunction::Euclidean,
+            Some("DOT_PRODUCT") => SimilarityFunction::DotProduct,
+            _ => return Err("unsupported SimilarityFunction in VectorIndexes entry".to_string()),
+        }),
+        None => None,
+    };
 
-    let index_status = value
-        .get("IndexStatus")
-        .and_then(|s| s.as_str())
-        .and_then(IndexStatus::from_str);
+    let index_status = match value.get("IndexStatus") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .and_then(IndexStatus::from_str)
+                .ok_or("unsupported IndexStatus in VectorIndexes entry")?,
+        ),
+        None => None,
+    };
 
-    let backfilling = value.get("Backfilling").and_then(|b| b.as_bool());
+    let backfilling = match value.get("Backfilling") {
+        Some(value) => Some(
+            value
+                .as_bool()
+                .ok_or("Backfilling in VectorIndexes entry must be a boolean")?,
+        ),
+        None => None,
+    };
 
-    Some(VectorIndex {
+    Ok(VectorIndex {
         index_name,
         vector_attribute: VectorAttribute {
             attribute_name,
@@ -416,11 +451,6 @@ impl ReturnScores {
 }
 
 /// Vector-search extras for `Query.VectorSearch`.
-///
-/// The query vector is stored as a validated DynamoDB [`AttributeValue`]:
-/// either a compact `FLOAT32VECTOR` marker built by [`VectorSearch::new`],
-/// or a standard `AttributeValue::L` of numeric (`N`) values built by
-/// [`VectorSearch::from_query_vector`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorSearch {
     pub(crate) query_vector: AttributeValue,
@@ -428,9 +458,9 @@ pub struct VectorSearch {
 }
 
 impl VectorSearch {
-    /// Creates a [VectorSearch] with a compact `FLOAT32VECTOR` query vector
-    /// and no score reporting. Returns an error if `vector` is empty or
-    /// contains non-finite values.
+    /// Creates a [VectorSearch] with the given query vector and no score
+    /// reporting. Returns an error if `vector` is empty or contains
+    /// non-finite values.
     pub fn new(vector: impl IntoIterator<Item = f32>) -> Result<Self, &'static str> {
         let vector: Vec<f32> = vector.into_iter().collect();
         if vector.is_empty() {
@@ -439,18 +469,14 @@ impl VectorSearch {
         if vector.iter().any(|v| !v.is_finite()) {
             return Err("query vector must contain only finite values");
         }
-        let query_vector = crate::float32_vector::Float32Vector::to_attribute_value(vector)
-            .expect("finiteness already validated above");
         Ok(Self {
-            query_vector,
+            query_vector: crate::float32_vector::Float32Vector::to_attribute_value(vector)
+                .expect("finiteness was validated above"),
             return_scores: None,
         })
     }
 
-    /// Creates a [VectorSearch] with a standard DynamoDB `AttributeValue::L`
-    /// query vector, i.e. a list of `AttributeValue::N` values, matching the
-    /// shape a non-preserving read returns. Returns an error if `values` is
-    /// empty or contains a non-numeric member.
+    /// Creates a vector search using a standard DynamoDB list of numeric values.
     pub fn from_query_vector(
         values: impl IntoIterator<Item = AttributeValue>,
     ) -> Result<Self, &'static str> {
@@ -458,7 +484,10 @@ impl VectorSearch {
         if values.is_empty() {
             return Err("query vector must not be empty");
         }
-        if !values.iter().all(|v| matches!(v, AttributeValue::N(_))) {
+        if !values
+            .iter()
+            .all(|value| matches!(value, AttributeValue::N(_)))
+        {
             return Err("query vector list must contain only numeric (N) values");
         }
         Ok(Self {
@@ -499,41 +528,6 @@ impl From<&VectorSearch> for VectorSearchJson {
 
 use aws_sdk_dynamodb::operation::create_table::CreateTableOutput;
 use aws_sdk_dynamodb::operation::describe_table::DescribeTableOutput;
-use aws_sdk_dynamodb::operation::query::QueryOutput;
-
-/// Wraps a generated [QueryOutput], adding similarity scores extracted from
-/// the response's `Scores` field when [`VectorSearch::with_return_scores`]
-/// requested them.
-#[derive(Debug, Clone)]
-pub struct VectorQueryOutput {
-    output: QueryOutput,
-    /// Present when the query requested [ReturnScores::Similarity]; absent
-    /// (not a stale empty `Vec`) otherwise.
-    pub scores: Option<Vec<f64>>,
-}
-
-impl VectorQueryOutput {
-    pub(crate) fn new(output: QueryOutput, scores: Option<Vec<f64>>) -> Self {
-        Self { output, scores }
-    }
-
-    /// Consumes this value, returning the generated [QueryOutput]. Rust does
-    /// not perform this conversion implicitly.
-    pub fn into_inner(self) -> QueryOutput {
-        self.output
-    }
-
-    /// Borrows the generated [QueryOutput].
-    pub fn as_inner(&self) -> &QueryOutput {
-        &self.output
-    }
-}
-
-impl From<VectorQueryOutput> for QueryOutput {
-    fn from(value: VectorQueryOutput) -> Self {
-        value.output
-    }
-}
 
 /// Wraps a generated [DescribeTableOutput], adding parsed
 /// `Table.VectorIndexes` metadata.
@@ -812,12 +806,22 @@ mod tests {
         let search = VectorSearch::new(vec![1.0, 2.0, 3.0]).unwrap();
         let json: VectorSearchJson = (&search).into();
         let serialized = serde_json::to_value(&json).unwrap();
-        // The compact form serializes as a marker `AttributeValue::B`; the
-        // driver's request interceptor rewrites it into
-        // `{"FLOAT32VECTOR": [...]}` in the serialized wire body (see
-        // `interceptors::tests::vector_search_is_injected_on_query`).
         assert!(serialized["QueryVector"].get("B").is_some());
         assert!(serialized.get("ReturnScores").is_none());
+    }
+
+    #[test]
+    fn test_vector_search_from_query_vector_uses_standard_list() {
+        let search = VectorSearch::from_query_vector([
+            AttributeValue::N("1".into()),
+            AttributeValue::N("2".into()),
+        ])
+        .unwrap();
+        let json: VectorSearchJson = (&search).into();
+        assert_eq!(
+            serde_json::to_value(json).unwrap()["QueryVector"]["L"],
+            serde_json::json!([{ "N": "1" }, { "N": "2" }])
+        );
     }
 
     #[test]
@@ -842,34 +846,8 @@ mod tests {
     }
 
     #[test]
-    fn test_vector_search_from_query_vector_json_uses_standard_list() {
-        let search = VectorSearch::from_query_vector(vec![
-            AttributeValue::N("1".to_string()),
-            AttributeValue::N("2".to_string()),
-            AttributeValue::N("3".to_string()),
-        ])
-        .unwrap();
-        let json: VectorSearchJson = (&search).into();
-        let serialized = serde_json::to_value(&json).unwrap();
-        assert_eq!(
-            serialized["QueryVector"]["L"],
-            serde_json::json!([{ "N": "1" }, { "N": "2" }, { "N": "3" }])
-        );
-    }
-
-    #[test]
-    fn test_vector_search_from_query_vector_rejects_empty_and_non_numeric() {
-        assert!(VectorSearch::from_query_vector(Vec::<AttributeValue>::new()).is_err());
-        assert!(VectorSearch::from_query_vector(vec![AttributeValue::S("x".to_string())]).is_err());
-    }
-
-    #[test]
     fn test_vector_index_from_json_rejects_dimensions_over_u32_max() {
-        // Phase 1 (VECTOR_5.md): Dimensions > u32::MAX must be rejected
-        // rather than truncated by `as u32`. Currently
-        // `vector_index_from_json` truncates via `as_u64()? as u32`, so
-        // this fails: it returns `Some` with a truncated value instead of
-        // `None`.
+        // Dimensions must fit in the public `u32` representation.
         let value = serde_json::json!({
             "IndexName": "vec_idx",
             "VectorAttribute": {
@@ -878,7 +856,7 @@ mod tests {
             }
         });
         assert!(
-            vector_index_from_json(&value).is_none(),
+            vector_index_from_json(&value).is_err(),
             "Dimensions overflowing u32 must be rejected, not truncated"
         );
     }

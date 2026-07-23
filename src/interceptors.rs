@@ -37,6 +37,7 @@ pub(crate) struct AlternatorInterceptor {
     optimize_headers: bool,
     user_agent: UserAgent,
     preserve_auth_headers: bool,
+    preserve_float32_vectors: bool,
 }
 impl AlternatorInterceptor {
     pub fn new(
@@ -45,6 +46,7 @@ impl AlternatorInterceptor {
         optimize_headers: bool,
         user_agent: UserAgent,
         preserve_auth_headers: bool,
+        preserve_float32_vectors: bool,
     ) -> Self {
         Self {
             request_compression,
@@ -52,6 +54,7 @@ impl AlternatorInterceptor {
             optimize_headers,
             user_agent,
             preserve_auth_headers,
+            preserve_float32_vectors,
         }
     }
 }
@@ -186,7 +189,7 @@ impl Intercept for AlternatorInterceptor {
         &self,
         context: &mut BeforeDeserializationInterceptorContextMut<'_>,
         _: &RuntimeComponents,
-        _cfg: &mut ConfigBag,
+        cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
         let response = context.response_mut();
 
@@ -211,21 +214,66 @@ impl Intercept for AlternatorInterceptor {
             }
         }
 
-        if algorithms.is_empty() {
-            return Ok(());
+        let was_compressed = !algorithms.is_empty();
+
+        if was_compressed {
+            // Take the body and wrap it with decompression
+            let body = std::mem::replace(
+                response.body_mut(),
+                aws_smithy_types::body::SdkBody::empty(),
+            );
+            let decompressed_body = crate::decompression::wrap_decompressed_body(body, algorithms)?;
+            *response.body_mut() = decompressed_body;
+
+            // Strip Content-Encoding and Content-Length headers
+            response.headers_mut().remove("content-encoding");
+            response.headers_mut().remove("content-length");
         }
 
-        // Take the body and wrap it with decompression
-        let body = std::mem::replace(
-            response.body_mut(),
-            aws_smithy_types::body::SdkBody::empty(),
-        );
-        let decompressed_body = crate::decompression::wrap_decompressed_body(body, algorithms)?;
-        *response.body_mut() = decompressed_body;
+        // Vector response transformation: rewrite FLOAT32VECTOR attributes
+        // (to L/N by default, or marker B when preserving) and extract
+        // Scores/VectorIndexes into any registered per-request response
+        // holder. Only successful responses are eligible; error bodies are
+        // left untouched so a service error is never turned into a local
+        // JSON error.
+        if response.status().is_success() {
+            let holder = cfg
+                .interceptor_state()
+                .load::<VectorResponseStore>()
+                .map(|store| store.0.clone());
 
-        // Strip Content-Encoding and Content-Length headers
-        response.headers_mut().remove("content-encoding");
-        response.headers_mut().remove("content-length");
+            // Precedence: per-operation override, then client configuration,
+            // then `false`.
+            let preserve_float32_vectors = cfg
+                .interceptor_state()
+                .load::<PreserveFloat32VectorsStore>()
+                .map(|store| store.preserve_float32_vectors)
+                .unwrap_or(self.preserve_float32_vectors);
+
+            let body = std::mem::replace(
+                response.body_mut(),
+                aws_smithy_types::body::SdkBody::empty(),
+            );
+            let transformed = crate::vector_response::wrap_vector_response_body(
+                body,
+                preserve_float32_vectors,
+                holder,
+            );
+            *response.body_mut() = transformed;
+
+            // The transformed body's byte length (and thus any prior
+            // Content-Length) and checksums are now stale regardless of
+            // whether a rewrite actually occurred, since that is only
+            // known once the body is fully buffered.
+            response.headers_mut().remove("content-length");
+            response.headers_mut().remove("x-amz-crc32");
+            response.headers_mut().remove("x-amz-crc32c");
+            response.headers_mut().remove("x-amz-checksum-crc32");
+            response.headers_mut().remove("x-amz-checksum-crc32c");
+            response.headers_mut().remove("x-amz-checksum-sha1");
+            response.headers_mut().remove("x-amz-checksum-sha256");
+            response.headers_mut().remove("x-amz-checksum-crc64nvme");
+        }
 
         Ok(())
     }
@@ -453,6 +501,14 @@ impl Storable for PreserveAuthHeadersStore {
     type Storer = StoreReplace<Self>;
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreserveFloat32VectorsStore {
+    pub(crate) preserve_float32_vectors: bool,
+}
+impl Storable for PreserveFloat32VectorsStore {
+    type Storer = StoreReplace<Self>;
+}
+
 /// An interceptor used to carry one per-operation Alternator override.
 ///
 /// Adds the specified override value to [ConfigBag], so that
@@ -495,6 +551,15 @@ impl AlternatorOverrideInterceptor<ResponseCompressionStore> {
         AlternatorOverrideInterceptor {
             store: ResponseCompressionStore {
                 response_compression,
+            },
+        }
+    }
+}
+impl AlternatorOverrideInterceptor<PreserveFloat32VectorsStore> {
+    pub(crate) fn for_preserve_float32_vectors(preserve_float32_vectors: bool) -> Self {
+        AlternatorOverrideInterceptor {
+            store: PreserveFloat32VectorsStore {
+                preserve_float32_vectors,
             },
         }
     }
@@ -723,6 +788,7 @@ mod tests {
                 false,
                 UserAgent::default(),
                 true,
+                false,
             ))
             .build();
         let client = aws_sdk_dynamodb::Client::from_conf(config);
@@ -826,6 +892,7 @@ mod tests {
                 false,
                 UserAgent::default(),
                 true,
+                false,
             ))
             .build();
         (aws_sdk_dynamodb::Client::from_conf(config), http_client)
@@ -863,6 +930,12 @@ mod tests {
             "vec_idx"
         );
     }
+
+    // `vector_index_updates()` is only available on `UpdateTable`'s
+    // `customize()` (see the operation-specific traits in
+    // `vector_interceptor.rs`), so calling it on `CreateTable` is a compile
+    // error. See the compile-fail doctest on `UpdateTableVectorExt` for
+    // coverage.
 
     #[tokio::test]
     async fn vector_search_is_injected_on_query() {

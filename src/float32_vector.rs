@@ -159,6 +159,21 @@ pub(crate) fn rewrite_request_json_markers(value: &mut serde_json::Value) {
     }
 }
 
+/// Converts the generated SDK's attribute-value representation into its wire
+/// JSON shape so extension fields can embed an attribute value directly.
+pub(crate) fn attribute_value_to_json(value: &AttributeValue) -> serde_json::Value {
+    match value {
+        AttributeValue::B(blob) => serde_json::json!({
+            "B": base64::engine::general_purpose::STANDARD.encode(blob.as_ref())
+        }),
+        AttributeValue::N(number) => serde_json::json!({ "N": number }),
+        AttributeValue::L(values) => serde_json::json!({
+            "L": values.iter().map(attribute_value_to_json).collect::<Vec<_>>()
+        }),
+        _ => unreachable!("VectorSearch accepts only FLOAT32VECTOR markers or numeric lists"),
+    }
+}
+
 /// Extension trait providing read access to `FLOAT32VECTOR` marker values
 /// without mutating the received `AttributeValue`.
 pub trait Float32VectorExt {
@@ -263,45 +278,6 @@ pub(crate) fn rewrite_response_json_markers(value: &mut serde_json::Value, prese
 /// in scientific notation for the magnitudes vectors use.
 fn format_n(v: f64) -> String {
     v.to_string()
-}
-
-/// Converts a generated [`AttributeValue`] into the DynamoDB/Alternator
-/// wire-format JSON object it would be serialized as, e.g.
-/// `{"N": "1"}` or `{"L": [...]}`. Used for driver-constructed request
-/// extras (such as `VectorSearch.QueryVector`) that the generated SDK does
-/// not know how to serialize on its own.
-pub(crate) fn attribute_value_to_json(av: &AttributeValue) -> serde_json::Value {
-    match av {
-        AttributeValue::B(blob) => {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(blob.as_ref());
-            serde_json::json!({ "B": b64 })
-        }
-        AttributeValue::Bool(b) => serde_json::json!({ "BOOL": b }),
-        AttributeValue::Bs(blobs) => {
-            let items: Vec<String> = blobs
-                .iter()
-                .map(|b| base64::engine::general_purpose::STANDARD.encode(b.as_ref()))
-                .collect();
-            serde_json::json!({ "BS": items })
-        }
-        AttributeValue::L(items) => {
-            let items: Vec<serde_json::Value> = items.iter().map(attribute_value_to_json).collect();
-            serde_json::json!({ "L": items })
-        }
-        AttributeValue::M(map) => {
-            let obj: serde_json::Map<String, serde_json::Value> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), attribute_value_to_json(v)))
-                .collect();
-            serde_json::json!({ "M": obj })
-        }
-        AttributeValue::N(n) => serde_json::json!({ "N": n }),
-        AttributeValue::Ns(ns) => serde_json::json!({ "NS": ns }),
-        AttributeValue::Null(n) => serde_json::json!({ "NULL": n }),
-        AttributeValue::S(s) => serde_json::json!({ "S": s }),
-        AttributeValue::Ss(ss) => serde_json::json!({ "SS": ss }),
-        _ => serde_json::Value::Null,
-    }
 }
 
 #[cfg(test)]

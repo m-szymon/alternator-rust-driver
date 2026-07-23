@@ -13,6 +13,7 @@ mod routing_scope;
 mod user_agent;
 pub mod vector;
 mod vector_interceptor;
+mod vector_response;
 
 pub use crate::client::*;
 pub use crate::compression::*;
@@ -27,8 +28,13 @@ pub(crate) use crate::query_plan::*;
 pub use crate::routing_scope::*;
 pub use crate::user_agent::*;
 pub use crate::vector::{
-    IndexStatus, Projection, ProjectionType, ReturnScores, SimilarityFunction, VectorAttribute,
-    VectorIndex, VectorIndexUpdate, VectorSearch,
+    CreateTableWithVectorIndexes, DescribeTableWithVectorIndexes, IndexStatus, Projection,
+    ProjectionType, ReturnScores, SimilarityFunction, VectorAttribute, VectorIndex,
+    VectorIndexUpdate, VectorSearch,
 };
 pub(crate) use crate::vector_interceptor::VectorRequestStore;
-pub use crate::vector_interceptor::{CreateTableVectorExt, QueryVectorExt, UpdateTableVectorExt};
+pub(crate) use crate::vector_interceptor::VectorResponseStore;
+pub use crate::vector_interceptor::{
+    CreateTableVectorExt, DescribeTableVectorExt, QueryVectorExt, UpdateTableVectorExt,
+    VectorCreateTableOperation, VectorDescribeTableOperation,
+};

@@ -1,11 +1,24 @@
-use crate::vector::{VectorIndex, VectorIndexUpdate, VectorSearch};
+use crate::vector::{
+    CreateTableWithVectorIndexes, DescribeTableWithVectorIndexes, VectorIndex, VectorIndexUpdate,
+    VectorSearch,
+};
+use crate::{AlternatorCustomizableOperation, AlternatorOperationBuilder};
 
 use aws_sdk_dynamodb::client::customize::CustomizableOperation;
+use aws_sdk_dynamodb::operation::create_table::CreateTableError;
+use aws_sdk_dynamodb::operation::create_table::builders::CreateTableFluentBuilder;
+use aws_sdk_dynamodb::operation::describe_table::DescribeTableError;
+use aws_sdk_dynamodb::operation::describe_table::builders::DescribeTableFluentBuilder;
+use aws_sdk_dynamodb::operation::update_table::UpdateTableError;
+use aws_sdk_dynamodb::operation::update_table::builders::UpdateTableFluentBuilder;
 use aws_smithy_runtime_api::box_error::BoxError;
 use aws_smithy_runtime_api::client::interceptors::Intercept;
 use aws_smithy_runtime_api::client::interceptors::context::BeforeSerializationInterceptorContextMut;
+use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+use aws_smithy_runtime_api::client::result::SdkError;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::config_bag::{ConfigBag, Storable, StoreReplace};
+use std::sync::{Arc, Mutex};
 
 /// State carried through [ConfigBag] describing vector-search request
 /// extras that [crate::AlternatorInterceptor] should inject into the
@@ -79,28 +92,108 @@ impl Intercept for VectorRequestStoreInterceptor {
     }
 }
 
-/// Extension trait that adds `VectorIndexes` support to CreateTable's
-/// [CustomizableOperation](aws_sdk_dynamodb::client::customize::CustomizableOperation).
+/// Per-operation vector-search response data extracted by
+/// [crate::AlternatorInterceptor] from the raw response JSON, before
+/// generated SDK deserialization.
 ///
-/// Implemented only for the generated CreateTable customizable operation, so
-/// misuse on other operations is a compile error rather than a runtime one.
-pub trait CreateTableVectorExt {
-    fn vector_indexes(self, indexes: Vec<VectorIndex>) -> Self;
+/// Never client-global: each request creates its own holder in [ConfigBag]
+/// state, so concurrent vector requests cannot observe each other's scores
+/// or index metadata. If a server response omits an optional field, the
+/// corresponding holder field remains `None`, not stale state from a prior
+/// request.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct VectorResponseHolder {
+    pub(crate) scores: Option<Vec<f64>>,
+    pub(crate) vector_indexes: Option<Vec<VectorIndex>>,
 }
 
-impl<E, B> CreateTableVectorExt
-    for CustomizableOperation<aws_sdk_dynamodb::operation::create_table::CreateTableOutput, E, B>
-{
-    fn vector_indexes(self, indexes: Vec<VectorIndex>) -> Self {
-        self.interceptor(VectorRequestStoreInterceptor::for_vector_indexes(indexes))
+/// [ConfigBag] wrapper carrying the shared, per-operation
+/// [VectorResponseHolder] that [crate::AlternatorInterceptor] fills in
+/// during `modify_before_deserialization`.
+#[derive(Debug, Clone)]
+pub(crate) struct VectorResponseStore(pub(crate) Arc<Mutex<VectorResponseHolder>>);
+
+impl Storable for VectorResponseStore {
+    type Storer = StoreReplace<Self>;
+}
+
+/// Per-operation interceptor that attaches a fresh [VectorResponseHolder]
+/// to [ConfigBag], to be filled in later by [crate::AlternatorInterceptor]
+/// after response decompression and before generated SDK deserialization.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct VectorResponseHolderInterceptor {
+    holder: Arc<Mutex<VectorResponseHolder>>,
+}
+
+impl VectorResponseHolderInterceptor {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn holder(&self) -> Arc<Mutex<VectorResponseHolder>> {
+        self.holder.clone()
     }
 }
 
-/// Extension trait that adds `VectorIndexUpdates` support to UpdateTable's
-/// [CustomizableOperation](aws_sdk_dynamodb::client::customize::CustomizableOperation).
+impl Intercept for VectorResponseHolderInterceptor {
+    fn name(&self) -> &'static str {
+        "VectorResponseHolderInterceptor"
+    }
+
+    fn modify_before_serialization(
+        &self,
+        _: &mut BeforeSerializationInterceptorContextMut<'_>,
+        _: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        cfg.interceptor_state()
+            .store_put(VectorResponseStore(self.holder.clone()));
+
+        Ok(())
+    }
+}
+
+/// Extension trait that adds `VectorIndexes` support to `CreateTable`.
 ///
-/// Implemented only for the generated UpdateTable customizable operation, so
-/// misuse on other operations is a compile error rather than a runtime one:
+/// Implemented for both the generated
+/// [`CreateTableFluentBuilder`] and its
+/// [`CustomizableOperation`](aws_sdk_dynamodb::client::customize::CustomizableOperation),
+/// so misuse on other operations is a compile error rather than a runtime
+/// one. The fluent-builder form is the preferred direct syntax:
+///
+/// ```no_run
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// use alternator_driver::{AlternatorClient, AlternatorConfig, CreateTableVectorExt, VectorAttribute, VectorIndex};
+///
+/// let client = AlternatorClient::from_conf(
+///     AlternatorConfig::builder().behavior_version_latest().build(),
+/// );
+///
+/// let index = VectorIndex::builder()
+///     .index_name("vec_idx")
+///     .vector_attribute(
+///         VectorAttribute::builder()
+///             .attribute_name("embedding")
+///             .dimensions(128)
+///             .build()
+///             .unwrap(),
+///     )
+///     .build()
+///     .unwrap();
+///
+/// let created = client
+///     .create_table()
+///     .table_name("Documents")
+///     .vector_indexes(vec![index])
+///     .send()
+///     .await
+///     .unwrap();
+/// println!("{:?}", created.vector_indexes);
+/// # });
+/// ```
+///
+/// The `.customize()` form remains available to combine with
+/// `.alternator_config_override(...)`:
 ///
 /// ```compile_fail
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -114,18 +207,73 @@ impl<E, B> CreateTableVectorExt
 /// let _ = client
 ///     .create_table()
 ///     .table_name("t")
-///     .customize()
 ///     .vector_index_updates(Vec::<VectorIndexUpdate>::new());
 /// # });
 /// ```
+pub trait CreateTableVectorExt {
+    /// The type returned by [`vector_indexes`](Self::vector_indexes).
+    type Output;
+
+    fn vector_indexes(self, indexes: Vec<VectorIndex>) -> Self::Output;
+}
+
+impl CreateTableVectorExt for CreateTableFluentBuilder {
+    type Output = VectorCreateTableOperation;
+
+    fn vector_indexes(self, indexes: Vec<VectorIndex>) -> Self::Output {
+        self.customize().vector_indexes(indexes)
+    }
+}
+
+impl CreateTableVectorExt
+    for CustomizableOperation<
+        aws_sdk_dynamodb::operation::create_table::CreateTableOutput,
+        CreateTableError,
+        CreateTableFluentBuilder,
+    >
+{
+    type Output = VectorCreateTableOperation;
+
+    fn vector_indexes(self, indexes: Vec<VectorIndex>) -> Self::Output {
+        let response_interceptor = VectorResponseHolderInterceptor::new();
+        let holder = response_interceptor.holder();
+        let inner = self
+            .interceptor(response_interceptor)
+            .interceptor(VectorRequestStoreInterceptor::for_vector_indexes(indexes));
+        VectorCreateTableOperation { inner, holder }
+    }
+}
+
+/// Extension trait that adds `VectorIndexUpdates` support to `UpdateTable`.
+///
+/// Implemented for both the generated [`UpdateTableFluentBuilder`] and its
+/// `CustomizableOperation`. `UpdateTable` has no extended response output,
+/// so this continues to return the generated customizable operation
+/// unchanged, and `.send()` returns the generated `UpdateTableOutput`.
 pub trait UpdateTableVectorExt {
-    fn vector_index_updates(self, updates: Vec<VectorIndexUpdate>) -> Self;
+    type Output;
+
+    fn vector_index_updates(self, updates: Vec<VectorIndexUpdate>) -> Self::Output;
+}
+
+impl UpdateTableVectorExt for UpdateTableFluentBuilder {
+    type Output = CustomizableOperation<
+        aws_sdk_dynamodb::operation::update_table::UpdateTableOutput,
+        UpdateTableError,
+        UpdateTableFluentBuilder,
+    >;
+
+    fn vector_index_updates(self, updates: Vec<VectorIndexUpdate>) -> Self::Output {
+        self.customize().vector_index_updates(updates)
+    }
 }
 
 impl<E, B> UpdateTableVectorExt
     for CustomizableOperation<aws_sdk_dynamodb::operation::update_table::UpdateTableOutput, E, B>
 {
-    fn vector_index_updates(self, updates: Vec<VectorIndexUpdate>) -> Self {
+    type Output = Self;
+
+    fn vector_index_updates(self, updates: Vec<VectorIndexUpdate>) -> Self::Output {
         self.interceptor(VectorRequestStoreInterceptor::for_vector_index_updates(
             updates,
         ))
@@ -146,6 +294,113 @@ impl<E, B> QueryVectorExt
 {
     fn vector_search(self, search: VectorSearch) -> Self {
         self.interceptor(VectorRequestStoreInterceptor::for_vector_search(search))
+    }
+}
+
+/// Extension trait that adds vector-index response metadata to
+/// `DescribeTable`. `DescribeTable` has no vector-only request field, so
+/// this trait only affects the response.
+pub trait DescribeTableVectorExt {
+    type Output;
+
+    /// Requests parsed `Table.VectorIndexes` metadata in the response.
+    fn with_vector_indexes(self) -> Self::Output;
+}
+
+impl DescribeTableVectorExt for DescribeTableFluentBuilder {
+    type Output = VectorDescribeTableOperation;
+
+    fn with_vector_indexes(self) -> Self::Output {
+        self.customize().with_vector_indexes()
+    }
+}
+
+impl DescribeTableVectorExt
+    for CustomizableOperation<
+        aws_sdk_dynamodb::operation::describe_table::DescribeTableOutput,
+        DescribeTableError,
+        DescribeTableFluentBuilder,
+    >
+{
+    type Output = VectorDescribeTableOperation;
+
+    fn with_vector_indexes(self) -> Self::Output {
+        let response_interceptor = VectorResponseHolderInterceptor::new();
+        let holder = response_interceptor.holder();
+        let inner = self.interceptor(response_interceptor);
+        VectorDescribeTableOperation { inner, holder }
+    }
+}
+
+/// Response-aware wrapper returned by
+/// [`CreateTableVectorExt::vector_indexes`].
+pub struct VectorCreateTableOperation {
+    inner: CustomizableOperation<
+        aws_sdk_dynamodb::operation::create_table::CreateTableOutput,
+        CreateTableError,
+        CreateTableFluentBuilder,
+    >,
+    holder: Arc<Mutex<VectorResponseHolder>>,
+}
+
+impl VectorCreateTableOperation {
+    pub fn alternator_config_override(
+        mut self,
+        config_override: impl Into<AlternatorOperationBuilder>,
+    ) -> Self {
+        self.inner = self.inner.alternator_config_override(config_override);
+        self
+    }
+
+    /// Sends the request, returning [`CreateTableWithVectorIndexes`].
+    pub async fn send(
+        self,
+    ) -> Result<CreateTableWithVectorIndexes, SdkError<CreateTableError, HttpResponse>> {
+        let holder = self.holder;
+        let output = self.inner.send().await?;
+        let vector_indexes = holder
+            .lock()
+            .expect("holder mutex poisoned")
+            .vector_indexes
+            .take()
+            .unwrap_or_default();
+        Ok(CreateTableWithVectorIndexes::new(output, vector_indexes))
+    }
+}
+
+/// Response-aware wrapper returned by
+/// [`DescribeTableVectorExt::with_vector_indexes`].
+pub struct VectorDescribeTableOperation {
+    inner: CustomizableOperation<
+        aws_sdk_dynamodb::operation::describe_table::DescribeTableOutput,
+        DescribeTableError,
+        DescribeTableFluentBuilder,
+    >,
+    holder: Arc<Mutex<VectorResponseHolder>>,
+}
+
+impl VectorDescribeTableOperation {
+    pub fn alternator_config_override(
+        mut self,
+        config_override: impl Into<AlternatorOperationBuilder>,
+    ) -> Self {
+        self.inner = self.inner.alternator_config_override(config_override);
+        self
+    }
+
+    /// Sends the request, returning [`DescribeTableWithVectorIndexes`].
+    pub async fn send(
+        self,
+    ) -> Result<DescribeTableWithVectorIndexes, SdkError<DescribeTableError, HttpResponse>> {
+        let holder = self.holder;
+        let output = self.inner.send().await?;
+        let vector_indexes = holder
+            .lock()
+            .expect("holder mutex poisoned")
+            .vector_indexes
+            .take()
+            .unwrap_or_default();
+        Ok(DescribeTableWithVectorIndexes::new(output, vector_indexes))
     }
 }
 
