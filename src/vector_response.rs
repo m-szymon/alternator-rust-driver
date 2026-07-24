@@ -2,9 +2,9 @@
 //!
 //! Wraps an `SdkBody` with a lazy transformer that buffers the full
 //! response, then (for successful, JSON, `FLOAT32VECTOR`-bearing bodies)
-//! rewrites `FLOAT32VECTOR` attributes and extracts `VectorIndexes` into a
-//! per-request [VectorResponseHolder] before handing transformed bytes to
-//! the generated SDK deserializer.
+//! rewrites `FLOAT32VECTOR` attributes and extracts `Scores` /
+//! `VectorIndexes` into a per-request [VectorResponseHolder] before handing
+//! transformed bytes to the generated SDK deserializer.
 //!
 //! Errors from the inner body are propagated unchanged. Empty bodies,
 //! non-JSON bodies, and JSON parse failures are passed through unchanged
@@ -121,9 +121,10 @@ impl http_body::Body for VectorTransformBody {
     }
 }
 
-/// Transforms a fully-buffered response body: extracts `VectorIndexes` into
-/// `holder` (if present) and rewrites `FLOAT32VECTOR` attributes. Returns
-/// the original bytes unchanged for empty, non-JSON, or unparsable bodies.
+/// Transforms a fully-buffered response body: extracts `Scores` and
+/// `VectorIndexes` into `holder` (if present) and rewrites `FLOAT32VECTOR`
+/// attributes. Returns the original bytes unchanged for empty, non-JSON,
+/// or unparsable bodies.
 fn transform_bytes(
     bytes: &[u8],
     preserve: bool,
@@ -145,6 +146,27 @@ fn transform_bytes(
     };
 
     if let Some(holder) = holder {
+        if let Some(scores_value) = json.get("Scores") {
+            let scores = scores_value
+                .as_array()
+                .ok_or("Scores response field must be an array")?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_f64()
+                        .ok_or("Scores response field must contain numbers")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            if let Some(items) = json.get("Items").and_then(serde_json::Value::as_array)
+                && items.len() != scores.len()
+            {
+                return Err("Items and Scores response fields must have the same length".into());
+            }
+
+            holder.lock().expect("holder mutex poisoned").scores = Some(scores);
+        }
+
         for key in ["Table", "TableDescription"] {
             if let Some(indexes_value) = json.get(key).and_then(|t| t.get("VectorIndexes")) {
                 let indexes = indexes_value
@@ -299,6 +321,30 @@ mod tests {
         let out = drain(body).await;
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert!(parsed["Item"]["embedding"].get("B").is_some());
+    }
+
+    #[tokio::test]
+    async fn extracts_scores_into_holder() {
+        let original = serde_json::json!({ "Items": [{}, {}], "Scores": [0.9, 0.1] });
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let holder = Arc::new(Mutex::new(VectorResponseHolder::default()));
+        let body = wrap_vector_response_body(SdkBody::from(bytes), false, Some(holder.clone()));
+        let _ = drain(body).await;
+        assert_eq!(holder.lock().unwrap().scores, Some(vec![0.9, 0.1]));
+    }
+
+    #[tokio::test]
+    async fn rejects_scores_with_mismatched_items() {
+        let original = serde_json::json!({ "Items": [], "Scores": [0.9] });
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let holder = Arc::new(Mutex::new(VectorResponseHolder::default()));
+        let body = wrap_vector_response_body(SdkBody::from(bytes), false, Some(holder));
+
+        let error = body.collect().await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Items and Scores response fields must have the same length"
+        );
     }
 
     #[tokio::test]

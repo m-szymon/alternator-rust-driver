@@ -528,6 +528,41 @@ impl From<&VectorSearch> for VectorSearchJson {
 
 use aws_sdk_dynamodb::operation::create_table::CreateTableOutput;
 use aws_sdk_dynamodb::operation::describe_table::DescribeTableOutput;
+use aws_sdk_dynamodb::operation::query::QueryOutput;
+
+/// Wraps a generated [QueryOutput], adding similarity scores extracted from
+/// the response's `Scores` field when [`VectorSearch::with_return_scores`]
+/// requested them.
+#[derive(Debug, Clone)]
+pub struct VectorQueryOutput {
+    output: QueryOutput,
+    /// Present when the query requested [ReturnScores::Similarity]; absent
+    /// (not a stale empty `Vec`) otherwise.
+    pub scores: Option<Vec<f64>>,
+}
+
+impl VectorQueryOutput {
+    pub(crate) fn new(output: QueryOutput, scores: Option<Vec<f64>>) -> Self {
+        Self { output, scores }
+    }
+
+    /// Consumes this value, returning the generated [QueryOutput]. Rust does
+    /// not perform this conversion implicitly.
+    pub fn into_inner(self) -> QueryOutput {
+        self.output
+    }
+
+    /// Borrows the generated [QueryOutput].
+    pub fn as_inner(&self) -> &QueryOutput {
+        &self.output
+    }
+}
+
+impl From<VectorQueryOutput> for QueryOutput {
+    fn from(value: VectorQueryOutput) -> Self {
+        value.output
+    }
+}
 
 /// Wraps a generated [DescribeTableOutput], adding parsed
 /// `Table.VectorIndexes` metadata.

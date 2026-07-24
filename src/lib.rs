@@ -30,11 +30,11 @@ pub use crate::user_agent::*;
 pub use crate::vector::{
     CreateTableWithVectorIndexes, DescribeTableWithVectorIndexes, IndexStatus, Projection,
     ProjectionType, ReturnScores, SimilarityFunction, VectorAttribute, VectorIndex,
-    VectorIndexUpdate, VectorSearch,
+    VectorIndexUpdate, VectorQueryOutput, VectorSearch,
 };
 pub(crate) use crate::vector_interceptor::VectorRequestStore;
 pub(crate) use crate::vector_interceptor::VectorResponseStore;
 pub use crate::vector_interceptor::{
     CreateTableVectorExt, DescribeTableVectorExt, QueryVectorExt, UpdateTableVectorExt,
-    VectorCreateTableOperation, VectorDescribeTableOperation,
+    VectorCreateTableOperation, VectorDescribeTableOperation, VectorQueryOperation,
 };

@@ -1,6 +1,6 @@
 use crate::vector::{
     CreateTableWithVectorIndexes, DescribeTableWithVectorIndexes, VectorIndex, VectorIndexUpdate,
-    VectorSearch,
+    VectorQueryOutput, VectorSearch,
 };
 use crate::{AlternatorCustomizableOperation, AlternatorOperationBuilder};
 
@@ -9,6 +9,8 @@ use aws_sdk_dynamodb::operation::create_table::CreateTableError;
 use aws_sdk_dynamodb::operation::create_table::builders::CreateTableFluentBuilder;
 use aws_sdk_dynamodb::operation::describe_table::DescribeTableError;
 use aws_sdk_dynamodb::operation::describe_table::builders::DescribeTableFluentBuilder;
+use aws_sdk_dynamodb::operation::query::QueryError;
+use aws_sdk_dynamodb::operation::query::builders::QueryFluentBuilder;
 use aws_sdk_dynamodb::operation::update_table::UpdateTableError;
 use aws_sdk_dynamodb::operation::update_table::builders::UpdateTableFluentBuilder;
 use aws_smithy_runtime_api::box_error::BoxError;
@@ -280,20 +282,41 @@ impl<E, B> UpdateTableVectorExt
     }
 }
 
-/// Extension trait that adds `VectorSearch` support to Query's
-/// [CustomizableOperation](aws_sdk_dynamodb::client::customize::CustomizableOperation).
+/// Extension trait that adds `VectorSearch` support to `Query`.
 ///
-/// Implemented only for the generated Query customizable operation, so
-/// misuse on other operations is a compile error rather than a runtime one.
+/// Implemented for both the generated [`QueryFluentBuilder`] and its
+/// `CustomizableOperation`. `.send()` returns [`VectorQueryOutput`], which
+/// wraps the generated `QueryOutput` and adds similarity scores.
 pub trait QueryVectorExt {
-    fn vector_search(self, search: VectorSearch) -> Self;
+    type Output;
+
+    fn vector_search(self, search: VectorSearch) -> Self::Output;
 }
 
-impl<E, B> QueryVectorExt
-    for CustomizableOperation<aws_sdk_dynamodb::operation::query::QueryOutput, E, B>
+impl QueryVectorExt for QueryFluentBuilder {
+    type Output = VectorQueryOperation;
+
+    fn vector_search(self, search: VectorSearch) -> Self::Output {
+        self.customize().vector_search(search)
+    }
+}
+
+impl QueryVectorExt
+    for CustomizableOperation<
+        aws_sdk_dynamodb::operation::query::QueryOutput,
+        QueryError,
+        QueryFluentBuilder,
+    >
 {
-    fn vector_search(self, search: VectorSearch) -> Self {
-        self.interceptor(VectorRequestStoreInterceptor::for_vector_search(search))
+    type Output = VectorQueryOperation;
+
+    fn vector_search(self, search: VectorSearch) -> Self::Output {
+        let response_interceptor = VectorResponseHolderInterceptor::new();
+        let holder = response_interceptor.holder();
+        let inner = self
+            .interceptor(response_interceptor)
+            .interceptor(VectorRequestStoreInterceptor::for_vector_search(search));
+        VectorQueryOperation { inner, holder }
     }
 }
 
@@ -329,6 +352,42 @@ impl DescribeTableVectorExt
         let holder = response_interceptor.holder();
         let inner = self.interceptor(response_interceptor);
         VectorDescribeTableOperation { inner, holder }
+    }
+}
+
+/// Response-aware wrapper returned by [`QueryVectorExt::vector_search`].
+///
+/// Wraps the generated `Query` [`CustomizableOperation`]; ordinary AWS SDK
+/// request setters must precede `.vector_search(...)`, since this wrapper
+/// only forwards [`alternator_config_override`](Self::alternator_config_override)
+/// on top of the wrapped operation.
+pub struct VectorQueryOperation {
+    inner: CustomizableOperation<
+        aws_sdk_dynamodb::operation::query::QueryOutput,
+        QueryError,
+        QueryFluentBuilder,
+    >,
+    holder: Arc<Mutex<VectorResponseHolder>>,
+}
+
+impl VectorQueryOperation {
+    /// Applies a per-request [`AlternatorOperationBuilder`] override, such as
+    /// `preserve_float32_vectors`, delegating to the wrapped
+    /// `CustomizableOperation`.
+    pub fn alternator_config_override(
+        mut self,
+        config_override: impl Into<AlternatorOperationBuilder>,
+    ) -> Self {
+        self.inner = self.inner.alternator_config_override(config_override);
+        self
+    }
+
+    /// Sends the request, returning [`VectorQueryOutput`].
+    pub async fn send(self) -> Result<VectorQueryOutput, SdkError<QueryError, HttpResponse>> {
+        let holder = self.holder;
+        let output = self.inner.send().await?;
+        let scores = holder.lock().expect("holder mutex poisoned").scores.take();
+        Ok(VectorQueryOutput::new(output, scores))
     }
 }
 

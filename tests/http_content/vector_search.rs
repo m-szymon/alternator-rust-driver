@@ -265,6 +265,56 @@ pub async fn test_update_table_sends_vector_index_updates(
 
 #[test_context(HttpTestContext<SyntheticResponseConfig>)]
 #[tokio::test]
+pub async fn test_query_sends_vector_search_and_exposes_scores(
+    ctx: &mut HttpTestContext<SyntheticResponseConfig>,
+) {
+    let last_body = Arc::new(TokioMutex::new(None));
+    capture_and_respond(
+        ctx,
+        StatusCode::OK,
+        serde_json::json!({
+            "Items": [{}, {}],
+            "Count": 2,
+            "ScannedCount": 2,
+            "Scores": [0.95, 0.42]
+        }),
+        last_body.clone(),
+    )
+    .await;
+    let client = synthetic_client(ctx);
+
+    let search = VectorSearch::new(vec![1.0, 2.0, 3.0])
+        .unwrap()
+        .with_return_scores(ReturnScores::Similarity);
+
+    let result = client
+        .query()
+        .table_name("some_table")
+        .index_name("embedding_idx")
+        .limit(10)
+        .expression_attribute_names("#pk", "pk")
+        .key_condition_expression("#pk = :pk")
+        .vector_search(search)
+        .send()
+        .await
+        .unwrap();
+
+    let body = last_body.lock().await.take().unwrap();
+    assert_eq!(
+        body["VectorSearch"]["QueryVector"]["FLOAT32VECTOR"],
+        serde_json::json!([1.0, 2.0, 3.0])
+    );
+    assert_eq!(body["VectorSearch"]["ReturnScores"], "SIMILARITY");
+    assert_eq!(result.scores, Some(vec![0.95, 0.42]));
+
+    // as_inner()/into_inner() convert to the generated QueryOutput.
+    assert_eq!(result.as_inner().count(), 2);
+    let plain: aws_sdk_dynamodb::operation::query::QueryOutput = result.into_inner();
+    assert_eq!(plain.count(), 2);
+}
+
+#[test_context(HttpTestContext<SyntheticResponseConfig>)]
+#[tokio::test]
 pub async fn test_vector_response_wrappers_parse_metadata_and_absent_fields(
     ctx: &mut HttpTestContext<SyntheticResponseConfig>,
 ) {
@@ -340,11 +390,32 @@ pub async fn test_vector_response_wrappers_preserve_service_errors(
     let last_body = Arc::new(TokioMutex::new(None));
     let error = serde_json::json!({
         "__type": "com.amazonaws.dynamodb.v20120810#ValidationException",
-        "message": "Vector index is not ready"
+        "message": "Vector index is not ready",
+        "Scores": [0.95]
     });
-    capture_and_respond(ctx, StatusCode::INTERNAL_SERVER_ERROR, error, last_body).await;
+    capture_and_respond(
+        ctx,
+        StatusCode::BAD_REQUEST,
+        error.clone(),
+        last_body.clone(),
+    )
+    .await;
     let client = synthetic_client(ctx);
 
+    let query_error = client
+        .query()
+        .table_name("some_table")
+        .index_name("embedding_idx")
+        .limit(10)
+        .vector_search(VectorSearch::new([1.0]).unwrap())
+        .send()
+        .await
+        .unwrap_err();
+    let service_error = query_error.as_service_error().unwrap();
+    assert_eq!(service_error.code(), Some("ValidationException"));
+    assert_eq!(service_error.message(), Some("Vector index is not ready"));
+
+    capture_and_respond(ctx, StatusCode::INTERNAL_SERVER_ERROR, error, last_body).await;
     let index = VectorIndex::builder()
         .index_name("vec_idx")
         .vector_attribute(
@@ -366,6 +437,80 @@ pub async fn test_vector_response_wrappers_preserve_service_errors(
     let service_error = create_error.as_service_error().unwrap();
     assert_eq!(service_error.code(), Some("ValidationException"));
     assert_eq!(service_error.message(), Some("Vector index is not ready"));
+}
+
+#[test_context(HttpTestContext<SyntheticResponseConfig>)]
+#[tokio::test]
+pub async fn test_query_customize_form_coexists_with_config_override(
+    ctx: &mut HttpTestContext<SyntheticResponseConfig>,
+) {
+    let last_body = Arc::new(TokioMutex::new(None));
+    capture_and_respond(
+        ctx,
+        StatusCode::OK,
+        serde_json::json!({
+            "Items": [{}, {}],
+            "Count": 2,
+            "ScannedCount": 2,
+            "Scores": [0.95, 0.42]
+        }),
+        last_body.clone(),
+    )
+    .await;
+    let client = synthetic_client(ctx);
+
+    let search = VectorSearch::new(vec![1.0, 2.0, 3.0])
+        .unwrap()
+        .with_return_scores(ReturnScores::Similarity);
+
+    // The `.customize()` form is equivalent to the direct form, and can be
+    // combined with a per-request `alternator_config_override(...)`.
+    let result = client
+        .query()
+        .table_name("some_table")
+        .index_name("embedding_idx")
+        .limit(10)
+        .customize()
+        .vector_search(search)
+        .alternator_config_override(
+            AlternatorConfig::operation_builder().preserve_float32_vectors(true),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let body = last_body.lock().await.take().unwrap();
+    assert_eq!(
+        body["VectorSearch"]["QueryVector"]["FLOAT32VECTOR"],
+        serde_json::json!([1.0, 2.0, 3.0])
+    );
+    assert_eq!(result.scores, Some(vec![0.95, 0.42]));
+}
+
+#[test_context(HttpTestContext<SyntheticResponseConfig>)]
+#[tokio::test]
+pub async fn test_ordinary_query_remains_aws_sdk_compatible(
+    ctx: &mut HttpTestContext<SyntheticResponseConfig>,
+) {
+    let last_body = Arc::new(TokioMutex::new(None));
+    capture_and_respond(
+        ctx,
+        StatusCode::OK,
+        serde_json::json!({ "Items": [], "Count": 0, "ScannedCount": 0 }),
+        last_body,
+    )
+    .await;
+    let client = synthetic_client(ctx);
+
+    // `query()` still returns the AWS SDK's own `QueryFluentBuilder`, not a
+    // vector builder, and its output is the generated `QueryOutput`.
+    let output: aws_sdk_dynamodb::operation::query::QueryOutput = client
+        .query()
+        .table_name("some_table")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(output.count(), 0);
 }
 
 #[test_context(HttpTestContext<SyntheticResponseConfig>)]
