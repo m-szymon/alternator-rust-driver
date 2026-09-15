@@ -83,10 +83,15 @@ impl Intercept for AlternatorInterceptor {
         _: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
-        // Rewrite any FLOAT32VECTOR marker binaries in the serialized JSON
-        // body into `{"FLOAT32VECTOR": [...]}`. This must happen before
-        // compression, so the order is always: serialized JSON -> vector
-        // rewrite -> optional compression -> signing.
+        // Inject Alternator's SearchVectors extensions (BaseRead) into the
+        // serialized JSON body, and rewrite any
+        // FLOAT32VECTOR marker binaries into `{"FLOAT32VECTOR": [...]}`.
+        // This must happen before compression, so the order is always:
+        // serialized JSON -> vector rewrite -> optional compression -> signing.
+        let search_vectors_extensions = cfg
+            .interceptor_state()
+            .load::<SearchVectorsExtensions>()
+            .cloned();
         let body_may_have_marker = context
             .request()
             .body()
@@ -96,8 +101,12 @@ impl Intercept for AlternatorInterceptor {
                 s.contains(crate::float32_vector::quick_base64_signature())
             })
             .unwrap_or(false);
-        if body_may_have_marker {
-            rewrite_vector_request_body(context)?;
+        if search_vectors_extensions.is_some() || body_may_have_marker {
+            rewrite_vector_request_body(
+                context,
+                search_vectors_extensions.as_ref(),
+                body_may_have_marker,
+            )?;
         }
 
         // check for overrides
@@ -289,13 +298,18 @@ fn operation_name_from_target(target: &str) -> Option<&str> {
     target.split('.').next_back()
 }
 
-/// Recursively rewrites any `FLOAT32VECTOR` marker binaries in the
-/// serialized JSON request body into `{"FLOAT32VECTOR": [...]}`.
+/// Injects Alternator's `SearchVectors` extensions (`BaseRead`) into the
+/// serialized JSON request body, and rewrites
+/// any `FLOAT32VECTOR` marker binaries into `{"FLOAT32VECTOR": [...]}`.
 ///
-/// If no marker binary actually applies, the body is left byte-for-byte
-/// unchanged.
+/// If extensions are attached to an operation other than `SearchVectors`,
+/// this returns a clear local error instead of silently ignoring caller
+/// intent. If neither extensions nor marker binaries apply, the body is left
+/// byte-for-byte unchanged.
 fn rewrite_vector_request_body(
     context: &mut BeforeTransmitInterceptorContextMut,
+    extensions: Option<&SearchVectorsExtensions>,
+    body_may_have_marker: bool,
 ) -> Result<(), BoxError> {
     let target = context
         .request()
@@ -317,13 +331,29 @@ fn rewrite_vector_request_body(
 
     let mut changed = false;
 
-    if operation == "SearchVectors" {
-        changed |= rewrite_search_vector_marker(&mut json)?;
+    if let Some(extensions) = extensions {
+        if operation != "SearchVectors" {
+            return Err(format!(
+                "SearchVectorsExt was used on a customize() call for operation '{operation}', \
+                 but BaseRead is only supported on SearchVectors requests"
+            )
+            .into());
+        }
+        if let Some(base_read) = extensions.base_read {
+            json["BaseRead"] = serde_json::Value::Bool(base_read);
+            changed = true;
+        }
     }
-    let before = json.clone();
-    crate::float32_vector::rewrite_request_json_markers(&mut json);
-    if json != before {
-        changed = true;
+
+    if body_may_have_marker {
+        if operation == "SearchVectors" {
+            changed |= rewrite_search_vector_marker(&mut json)?;
+        }
+        let before = json.clone();
+        crate::float32_vector::rewrite_request_json_markers(&mut json);
+        if json != before {
+            changed = true;
+        }
     }
 
     if !changed {

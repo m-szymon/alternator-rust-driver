@@ -24,6 +24,7 @@ mod live_nodes;
 mod optimize_headers;
 mod query_plan;
 mod routing_scope;
+mod search_vectors;
 mod user_agent;
 mod vector_response;
 
@@ -38,4 +39,6 @@ pub(crate) use crate::live_nodes::*;
 pub(crate) use crate::optimize_headers::*;
 pub(crate) use crate::query_plan::*;
 pub use crate::routing_scope::*;
+pub(crate) use crate::search_vectors::SearchVectorsExtensions;
+pub use crate::search_vectors::{SearchVectorsExt, SearchVectorsOperation};
 pub use crate::user_agent::*;
