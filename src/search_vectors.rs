@@ -18,14 +18,17 @@
 //! vector indexes (`CreateTable.VectorIndexes`, `UpdateTable.VectorIndexUpdates`,
 //! `DescribeTable`) and the `SearchVectors` operation are used through the
 //! ordinary generated `aws-sdk-dynamodb` builders. On top of that, Alternator
-//! accepts request parameters on `SearchVectors` that DynamoDB does not
+//! accepts two request parameters on `SearchVectors` that DynamoDB does not
 //! have, exposed here via [`SearchVectorsExt`]:
 //!
 //! - `BaseRead` (boolean, default `false`): whether to read matching items
 //!   from the base table instead of serving the response purely from the
 //!   attributes projected into the vector index.
+//! - `FilterExpression`: a post-filter applied to the `TopK` candidates found
+//!   by the approximate-nearest-neighbour search, with the same syntax as
+//!   `Query`/`Scan`'s `FilterExpression`.
 //!
-//! The other extension, the compact `FLOAT32VECTOR` type (also accepted as
+//! The third extension, the compact `FLOAT32VECTOR` type (also accepted as
 //! the `SearchVector` of a search), lives in [`crate::float32_vector`].
 
 use aws_sdk_dynamodb::client::customize::CustomizableOperation;
@@ -46,12 +49,16 @@ use aws_smithy_types::config_bag::{ConfigBag, Storable, StoreReplace};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SearchVectorsExtensions {
     pub(crate) base_read: Option<bool>,
+    pub(crate) filter_expression: Option<String>,
 }
 
 impl SearchVectorsExtensions {
     fn merge_from(&mut self, other: &Self) {
         if other.base_read.is_some() {
             self.base_read = other.base_read;
+        }
+        if other.filter_expression.is_some() {
+            self.filter_expression = other.filter_expression.clone();
         }
     }
 }
@@ -93,8 +100,8 @@ impl Intercept for SearchVectorsExtensionsInterceptor {
 pub type SearchVectorsOperation =
     CustomizableOperation<SearchVectorsOutput, SearchVectorsError, SearchVectorsFluentBuilder>;
 
-/// Extension trait adding Alternator's `BaseRead` parameter to the generated
-/// `SearchVectors` builder.
+/// Extension trait adding Alternator's `BaseRead` and `FilterExpression`
+/// parameters to the generated `SearchVectors` builder.
 ///
 /// Implemented for both [`SearchVectorsFluentBuilder`] and its
 /// [`CustomizableOperation`], so misuse on other operations is a compile
@@ -108,6 +115,7 @@ pub type SearchVectorsOperation =
 /// ```no_run
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
 /// use alternator_driver::{AlternatorClient, AlternatorConfig, Float32Vector, SearchVectorsExt};
+/// use aws_sdk_dynamodb::types::AttributeValue;
 ///
 /// let client = AlternatorClient::from_conf(
 ///     AlternatorConfig::builder().behavior_version_latest().build(),
@@ -119,7 +127,9 @@ pub type SearchVectorsOperation =
 ///     .index_name("embedding_idx")
 ///     .search_vector(Float32Vector::to_attribute_value([0.1, 0.2, 0.3]).unwrap())
 ///     .top_k(10)
+///     .expression_attribute_values(":lang", AttributeValue::S("en".into()))
 ///     .base_read(true)                       // <-- extension boundary
+///     .filter_expression("lang = :lang")
 ///     .send()
 ///     .await
 ///     .unwrap();
@@ -149,9 +159,17 @@ pub trait SearchVectorsExt {
     /// supports) the response is built entirely from the attributes
     /// projected into the vector index. With `true`, each matching item is
     /// read from the base table instead, so `ProjectionExpression` and
-    /// `ProjectionExpression` can reference any attribute of the item, at
-    /// the cost of an extra read per result.
+    /// [`filter_expression`](Self::filter_expression) can reference any
+    /// attribute of the item, at the cost of an extra read per result.
     fn base_read(self, base_read: bool) -> Self::Output;
+
+    /// Sets Alternator's `FilterExpression` parameter: a post-filter applied
+    /// to the `TopK` candidates found by the nearest-neighbour search. Uses
+    /// the same syntax and `ExpressionAttributeNames`/`ExpressionAttributeValues`
+    /// placeholders as `Query`'s `FilterExpression`. Because filtering
+    /// happens after candidate selection, fewer than `TopK` results may be
+    /// returned.
+    fn filter_expression(self, expression: impl Into<String>) -> Self::Output;
 }
 
 impl SearchVectorsExt for SearchVectorsFluentBuilder {
@@ -159,6 +177,10 @@ impl SearchVectorsExt for SearchVectorsFluentBuilder {
 
     fn base_read(self, base_read: bool) -> Self::Output {
         self.customize().base_read(base_read)
+    }
+
+    fn filter_expression(self, expression: impl Into<String>) -> Self::Output {
+        self.customize().filter_expression(expression)
     }
 }
 
@@ -169,6 +191,16 @@ impl SearchVectorsExt for SearchVectorsOperation {
         self.interceptor(SearchVectorsExtensionsInterceptor {
             extensions: SearchVectorsExtensions {
                 base_read: Some(base_read),
+                filter_expression: None,
+            },
+        })
+    }
+
+    fn filter_expression(self, expression: impl Into<String>) -> Self::Output {
+        self.interceptor(SearchVectorsExtensionsInterceptor {
+            extensions: SearchVectorsExtensions {
+                base_read: None,
+                filter_expression: Some(expression.into()),
             },
         })
     }
@@ -182,13 +214,20 @@ mod tests {
     fn merge_overrides_only_set_fields() {
         let mut base = SearchVectorsExtensions {
             base_read: Some(false),
+            filter_expression: Some("a = :a".into()),
         };
-        base.merge_from(&SearchVectorsExtensions { base_read: None });
-        assert_eq!(base.base_read, Some(false));
-
         base.merge_from(&SearchVectorsExtensions {
             base_read: Some(true),
+            filter_expression: None,
         });
         assert_eq!(base.base_read, Some(true));
+        assert_eq!(base.filter_expression.as_deref(), Some("a = :a"));
+
+        base.merge_from(&SearchVectorsExtensions {
+            base_read: None,
+            filter_expression: Some("b = :b".into()),
+        });
+        assert_eq!(base.base_read, Some(true));
+        assert_eq!(base.filter_expression.as_deref(), Some("b = :b"));
     }
 }

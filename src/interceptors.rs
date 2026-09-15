@@ -83,8 +83,8 @@ impl Intercept for AlternatorInterceptor {
         _: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
-        // Inject Alternator's SearchVectors extensions (BaseRead) into the
-        // serialized JSON body, and rewrite any
+        // Inject Alternator's SearchVectors extensions (BaseRead,
+        // FilterExpression) into the serialized JSON body, and rewrite any
         // FLOAT32VECTOR marker binaries into `{"FLOAT32VECTOR": [...]}`.
         // This must happen before compression, so the order is always:
         // serialized JSON -> vector rewrite -> optional compression -> signing.
@@ -298,8 +298,8 @@ fn operation_name_from_target(target: &str) -> Option<&str> {
     target.split('.').next_back()
 }
 
-/// Injects Alternator's `SearchVectors` extensions (`BaseRead`) into the
-/// serialized JSON request body, and rewrites
+/// Injects Alternator's `SearchVectors` extensions (`BaseRead`,
+/// `FilterExpression`) into the serialized JSON request body, and rewrites
 /// any `FLOAT32VECTOR` marker binaries into `{"FLOAT32VECTOR": [...]}`.
 ///
 /// If extensions are attached to an operation other than `SearchVectors`,
@@ -335,12 +335,16 @@ fn rewrite_vector_request_body(
         if operation != "SearchVectors" {
             return Err(format!(
                 "SearchVectorsExt was used on a customize() call for operation '{operation}', \
-                 but BaseRead is only supported on SearchVectors requests"
+                 but BaseRead/FilterExpression are only supported on SearchVectors requests"
             )
             .into());
         }
         if let Some(base_read) = extensions.base_read {
             json["BaseRead"] = serde_json::Value::Bool(base_read);
+            changed = true;
+        }
+        if let Some(filter_expression) = &extensions.filter_expression {
+            json["FilterExpression"] = serde_json::Value::String(filter_expression.clone());
             changed = true;
         }
     }
