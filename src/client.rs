@@ -791,6 +791,12 @@ impl AlternatorClient {
         self.dynamodb_client.restore_table_to_point_in_time()
     }
 
+    pub fn search_vectors(
+        &self,
+    ) -> aws_sdk_dynamodb::operation::search_vectors::builders::SearchVectorsFluentBuilder {
+        self.dynamodb_client.search_vectors()
+    }
+
     pub fn scan(&self) -> aws_sdk_dynamodb::operation::scan::builders::ScanFluentBuilder {
         self.dynamodb_client.scan()
     }
