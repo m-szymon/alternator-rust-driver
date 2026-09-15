@@ -51,6 +51,7 @@ pub(crate) struct AlternatorInterceptor {
     optimize_headers: bool,
     user_agent: UserAgent,
     preserve_auth_headers: bool,
+    preserve_float32_vectors: bool,
 }
 impl AlternatorInterceptor {
     pub fn new(
@@ -59,6 +60,7 @@ impl AlternatorInterceptor {
         optimize_headers: bool,
         user_agent: UserAgent,
         preserve_auth_headers: bool,
+        preserve_float32_vectors: bool,
     ) -> Self {
         Self {
             request_compression,
@@ -66,6 +68,7 @@ impl AlternatorInterceptor {
             optimize_headers,
             user_agent,
             preserve_auth_headers,
+            preserve_float32_vectors,
         }
     }
 }
@@ -80,6 +83,23 @@ impl Intercept for AlternatorInterceptor {
         _: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
+        // Rewrite any FLOAT32VECTOR marker binaries in the serialized JSON
+        // body into `{"FLOAT32VECTOR": [...]}`. This must happen before
+        // compression, so the order is always: serialized JSON -> vector
+        // rewrite -> optional compression -> signing.
+        let body_may_have_marker = context
+            .request()
+            .body()
+            .bytes()
+            .map(|b| {
+                let s = String::from_utf8_lossy(b);
+                s.contains(crate::float32_vector::quick_base64_signature())
+            })
+            .unwrap_or(false);
+        if body_may_have_marker {
+            rewrite_vector_request_body(context)?;
+        }
+
         // check for overrides
         let request_compression = cfg
             .interceptor_state()
@@ -182,7 +202,7 @@ impl Intercept for AlternatorInterceptor {
         &self,
         context: &mut BeforeDeserializationInterceptorContextMut<'_>,
         _: &RuntimeComponents,
-        _cfg: &mut ConfigBag,
+        cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
         let response = context.response_mut();
 
@@ -207,24 +227,155 @@ impl Intercept for AlternatorInterceptor {
             }
         }
 
-        if algorithms.is_empty() {
-            return Ok(());
+        let was_compressed = !algorithms.is_empty();
+
+        if was_compressed {
+            // Take the body and wrap it with decompression
+            let body = std::mem::replace(
+                response.body_mut(),
+                aws_smithy_types::body::SdkBody::empty(),
+            );
+            let decompressed_body = crate::decompression::wrap_decompressed_body(body, algorithms)?;
+            *response.body_mut() = decompressed_body;
+
+            // Strip Content-Encoding and Content-Length headers
+            response.headers_mut().remove("content-encoding");
+            response.headers_mut().remove("content-length");
         }
 
-        // Take the body and wrap it with decompression
-        let body = std::mem::replace(
-            response.body_mut(),
-            aws_smithy_types::body::SdkBody::empty(),
-        );
-        let decompressed_body = crate::decompression::wrap_decompressed_body(body, algorithms)?;
-        *response.body_mut() = decompressed_body;
+        // Vector response transformation: rewrite FLOAT32VECTOR attributes
+        // (to L/N by default, or marker B when preserving) so the generated
+        // SDK deserializer understands them. Only successful responses are
+        // eligible; error bodies are left untouched so a service error is
+        // never turned into a local JSON error.
+        if response.status().is_success() {
+            // Precedence: per-operation override, then client configuration,
+            // then `false`.
+            let preserve_float32_vectors = cfg
+                .interceptor_state()
+                .load::<PreserveFloat32VectorsStore>()
+                .map(|store| store.preserve_float32_vectors)
+                .unwrap_or(self.preserve_float32_vectors);
 
-        // Strip Content-Encoding and Content-Length headers
-        response.headers_mut().remove("content-encoding");
-        response.headers_mut().remove("content-length");
+            let body = std::mem::replace(
+                response.body_mut(),
+                aws_smithy_types::body::SdkBody::empty(),
+            );
+            let transformed =
+                crate::vector_response::wrap_vector_response_body(body, preserve_float32_vectors);
+            *response.body_mut() = transformed;
+
+            // The transformed body's byte length (and thus any prior
+            // Content-Length) and checksums are now stale regardless of
+            // whether a rewrite actually occurred, since that is only
+            // known once the body is fully buffered.
+            response.headers_mut().remove("content-length");
+            response.headers_mut().remove("x-amz-crc32");
+            response.headers_mut().remove("x-amz-crc32c");
+            response.headers_mut().remove("x-amz-checksum-crc32");
+            response.headers_mut().remove("x-amz-checksum-crc32c");
+            response.headers_mut().remove("x-amz-checksum-sha1");
+            response.headers_mut().remove("x-amz-checksum-sha256");
+            response.headers_mut().remove("x-amz-checksum-crc64nvme");
+        }
 
         Ok(())
     }
+}
+
+/// Identifies the DynamoDB/Alternator operation for a request from its
+/// `x-amz-target` header, e.g. `DynamoDB_20120810.CreateTable`.
+fn operation_name_from_target(target: &str) -> Option<&str> {
+    target.split('.').next_back()
+}
+
+/// Recursively rewrites any `FLOAT32VECTOR` marker binaries in the
+/// serialized JSON request body into `{"FLOAT32VECTOR": [...]}`.
+///
+/// If no marker binary actually applies, the body is left byte-for-byte
+/// unchanged.
+fn rewrite_vector_request_body(
+    context: &mut BeforeTransmitInterceptorContextMut,
+) -> Result<(), BoxError> {
+    let target = context
+        .request()
+        .headers()
+        .get("x-amz-target")
+        .unwrap_or_default()
+        .to_string();
+    let operation = operation_name_from_target(&target).unwrap_or_default();
+
+    let body = context
+        .request_mut()
+        .body_mut()
+        .bytes()
+        .ok_or("body not collected")?
+        .to_vec();
+
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| format!("failed to parse JSON body: {e}"))?;
+
+    let mut changed = false;
+
+    if operation == "SearchVectors" {
+        changed |= rewrite_search_vector_marker(&mut json)?;
+    }
+    let before = json.clone();
+    crate::float32_vector::rewrite_request_json_markers(&mut json);
+    if json != before {
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(());
+    }
+
+    let new_body =
+        serde_json::to_vec(&json).map_err(|e| format!("failed to serialize JSON body: {e}"))?;
+
+    context
+        .request_mut()
+        .headers_mut()
+        .insert("content-length", new_body.len().to_string());
+    *context.request_mut().body_mut() = new_body.into();
+
+    Ok(())
+}
+
+/// The generated SDK serializes `SearchVectors.SearchVector` as a JSON array
+/// of attribute values (`[{"N": "1"}, ...]`). Alternator additionally
+/// accepts the whole search vector as a single `{"FLOAT32VECTOR": [...]}`
+/// object, which a caller requests by passing exactly one `FLOAT32VECTOR`
+/// marker binary as the search vector. Rewrites that shape in place and
+/// returns whether the body changed; a marker mixed with other elements is
+/// a local error, since the generic per-element rewrite would otherwise
+/// produce a list of vectors the server rejects.
+fn rewrite_search_vector_marker(json: &mut serde_json::Value) -> Result<bool, BoxError> {
+    let Some(elements) = json.get("SearchVector").and_then(|v| v.as_array()) else {
+        return Ok(false);
+    };
+    let marker_values: Vec<Option<Vec<f32>>> = elements
+        .iter()
+        .map(crate::float32_vector::marker_json_values)
+        .collect();
+    let marker_count = marker_values.iter().filter(|v| v.is_some()).count();
+    if marker_count == 0 {
+        return Ok(false);
+    }
+    if elements.len() != 1 {
+        return Err(
+            "SearchVector must be either a list of numeric (N) values or exactly one \
+                    FLOAT32VECTOR value built with Float32Vector::to_attribute_value"
+                .into(),
+        );
+    }
+    let values = marker_values
+        .into_iter()
+        .next()
+        .flatten()
+        .expect("exactly one marker element");
+    json["SearchVector"] = serde_json::json!({ "FLOAT32VECTOR": values });
+    Ok(true)
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +399,14 @@ pub(crate) struct PreserveAuthHeadersStore {
     preserve_auth_headers: bool,
 }
 impl Storable for PreserveAuthHeadersStore {
+    type Storer = StoreReplace<Self>;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreserveFloat32VectorsStore {
+    pub(crate) preserve_float32_vectors: bool,
+}
+impl Storable for PreserveFloat32VectorsStore {
     type Storer = StoreReplace<Self>;
 }
 
@@ -293,6 +452,15 @@ impl AlternatorOverrideInterceptor<ResponseCompressionStore> {
         AlternatorOverrideInterceptor {
             store: ResponseCompressionStore {
                 response_compression,
+            },
+        }
+    }
+}
+impl AlternatorOverrideInterceptor<PreserveFloat32VectorsStore> {
+    pub(crate) fn for_preserve_float32_vectors(preserve_float32_vectors: bool) -> Self {
+        AlternatorOverrideInterceptor {
+            store: PreserveFloat32VectorsStore {
+                preserve_float32_vectors,
             },
         }
     }
@@ -486,6 +654,19 @@ mod tests {
     use aws_smithy_runtime_api::http::Request;
     use std::collections::HashMap;
 
+    #[test]
+    fn operation_name_from_target_extracts_operation() {
+        assert_eq!(
+            operation_name_from_target("DynamoDB_20120810.SearchVectors"),
+            Some("SearchVectors")
+        );
+        assert_eq!(
+            operation_name_from_target("DynamoDB_20120810.PutItem"),
+            Some("PutItem")
+        );
+        assert_eq!(operation_name_from_target(""), Some(""));
+    }
+
     fn s(value: &str) -> AttributeValue {
         AttributeValue::S(value.to_string())
     }
@@ -635,6 +816,7 @@ mod tests {
             ResponseCompression::disabled(),
             false,
             UserAgent::disabled(),
+            false,
             false,
         );
 

@@ -436,6 +436,7 @@ mod tests {
                 true,
                 UserAgent::default(),
                 true,
+                false,
             ));
 
         let discovery_client = aws_sdk_dynamodb::Client::from_conf(

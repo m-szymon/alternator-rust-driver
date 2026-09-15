@@ -49,6 +49,8 @@ tokio-util = { version = "0.7.18", features = ["io"] }
 futures-util = "0.3"
 http-body = "1.0.1"
 bytes = "1.11.1"
+base64 = "0.22"
+serde_json = "1.0"
 
 [dev-dependencies]
 anyhow = "1.0.103"
