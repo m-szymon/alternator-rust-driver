@@ -12,7 +12,7 @@ CCM_SCYLLA_VERSION ?= release:2026.1
 RUSTFLAGS_CCM ?= --cfg ccm_tests
 
 .PHONY: clean verify lint lint-docs lint-fix license-install license-check license-fix compile compile-test
-.PHONY: test-unit test-integration test-all
+.PHONY: test-unit test-integration test-all vector-store-e2e
 .PHONY: .prepare-ccm .prepare-environment-update-aio-max-nr
 .PHONY: wait-for-alternator scylla-start scylla-stop scylla-kill scylla-rm
 .PHONY: logs cqlsh
@@ -67,6 +67,14 @@ test-all: .prepare-ccm
 	trap - EXIT
 	RUSTFLAGS="$(RUSTFLAGS_CCM)" $(CARGO) test --test ccm_wrapper_tests -- --nocapture
 	RUSTFLAGS="$(RUSTFLAGS_CCM)" $(CARGO) test --test load_balancing_tests -- --nocapture
+
+# Opt-in Vector Store E2E test. Requires Docker (for Vector Store only) plus
+# SCYLLA_VECTOR_STORE_IMAGE, SCYLLA_VECTOR_STORE_PORT,
+# SCYLLA_VECTOR_STORE_SCYLLA_VERSION, and SCYLLA_VECTOR_STORE_SCYLLA_CONFIG.
+# Not part of `test-all`/CI: no default Vector Store environment contract is
+# provided.
+vector-store-e2e:
+	RUSTFLAGS="$(RUSTFLAGS_CCM)" $(CARGO) test --test vector_store_e2e -- --nocapture
 
 wait-for-alternator:
 	echo "Waiting for Alternator to be ready..."
